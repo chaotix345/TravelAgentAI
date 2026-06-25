@@ -74,5 +74,28 @@ export type VerifiedDay = {
   afternoon: VerifiedActivity;
   evening: VerifiedActivity;
 };
-export type VerifiedCity = Omit<City, "days"> & { days: VerifiedDay[] };
-export type VerifiedItinerary = Omit<Itinerary, "cities"> & { cities: VerifiedCity[] };
+
+// Same Approach-B idea applied to BUDGET: when the model calls estimate_costs, the route
+// grounds each city's cost level (bundled World Bank price levels + live Wikivoyage anchors)
+// and attaches the result here. Like the verify verdict, this is OURS — the displayed budget
+// is the tool's output, not a number the model asserted. Self-contained (no import from the
+// server-only cost module) so this file stays safe to pull types from in the client bundle.
+export type CostTier = "cheap" | "moderate" | "pricey" | "expensive" | "unknown";
+export type CityCostSummary = {
+  tier: CostTier;
+  dailyUsd: number | null; // per-person, per-day, all-in, for the chosen style
+  anchors: string[]; // verbatim real price examples from Wikivoyage
+};
+export type BudgetSummary = {
+  style: "budget" | "mid-range" | "luxury";
+  currency: "USD";
+  totalUsd: number | null; // per person, lodging+food+local; excludes flights/intercity
+  perDayUsd: number | null;
+  note: string;
+  flags: string[];
+};
+export type VerifiedCity = Omit<City, "days"> & { days: VerifiedDay[]; cost?: CityCostSummary };
+export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
+  cities: VerifiedCity[];
+  budget?: BudgetSummary;
+};

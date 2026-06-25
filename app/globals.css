@@ -355,6 +355,104 @@ button.link:hover {
   border: 1px solid #e6d2ad;
 }
 
+.budget {
+  margin: 0 0 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.budget-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.budget-amount {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.budget-sub {
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-transform: capitalize;
+}
+
+.budget-flags {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.budget-flags li {
+  font-size: 0.85rem;
+  color: var(--ink);
+  padding: 7px 12px;
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
+.budget-flags li::before {
+  content: "→ ";
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.budget-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.cost-chip {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 1px 9px;
+  border-radius: 999px;
+  vertical-align: middle;
+  white-space: nowrap;
+  text-transform: capitalize;
+  cursor: default;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--muted);
+}
+
+.cost-chip.cheap {
+  color: #2f6f3e;
+  background: #e7f3ea;
+  border-color: #c2e0c9;
+}
+
+.cost-chip.moderate {
+  color: #5a6b4a;
+  background: #eef3e7;
+  border-color: #d4e0c2;
+}
+
+.cost-chip.pricey {
+  color: #8a5a1c;
+  background: #f6ecd9;
+  border-color: #e6d2ad;
+}
+
+.cost-chip.expensive {
+  color: #8a2a1c;
+  background: #fdecea;
+  border-color: #f3c2bb;
+}
+
 .refine {
   margin-top: 32px;
   padding: 20px 18px 18px;
