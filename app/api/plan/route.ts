@@ -25,6 +25,14 @@ export const maxDuration = 300;
 // claude-sonnet-4-6 to cut cost roughly in half for a small quality trade.
 const MODEL = "claude-opus-4-8";
 const MAX_BRIEF_CHARS = 4000;
+// A refine request carries the prior plan JSON, which is user-supplied via the client.
+// Cap its serialized size so a pathological payload can't blow up token cost or memory; a
+// real 4-week plan is far under this. Over the cap → we ignore the refine and plan fresh.
+const MAX_REFINE_ITINERARY_CHARS = 200_000;
+// Hard ceiling on the raw request body, checked BEFORE we parse it (App Router route
+// handlers have no built-in body-size limit). Generous enough for a brief + a fully
+// annotated prior plan, but stops a multi-MB body from being buffered and parsed at all.
+const MAX_BODY_CHARS = 1_000_000;
 // Backstop on agent-loop iterations. Happy path: 2 model turns for a single city
 // (verify, then a forced emit) and 3 for a multi-city trip (verify, an optional
 // check_route, then a forced emit). We allow the model ONE retry if it calls
@@ -208,8 +216,18 @@ export async function POST(req: Request) {
 
   let brief = "";
   let clarifications: Array<{ prompt: string; answer: string }> = [];
+  // A refine request carries the latest plan plus a single change to apply. We re-ground it
+  // by running the SAME loop (forced verify → optional check_route → forced emit), so the
+  // revision is re-verified and, if its cities changed, re-routed — no second loop needed.
+  let refine: { itinerary: Itinerary; instruction: string } | null = null;
   try {
-    const body = await req.json();
+    // Read the body as text first so an oversized payload is rejected before it's buffered
+    // and parsed in full — req.json() would do both before any size check could run.
+    const raw = await req.text();
+    if (raw.length > MAX_BODY_CHARS) {
+      return NextResponse.json({ error: "Request is too large." }, { status: 413 });
+    }
+    const body = JSON.parse(raw);
     brief = typeof body?.brief === "string" ? body.brief.trim() : "";
     if (Array.isArray(body?.clarifications)) {
       clarifications = (body.clarifications as unknown[])
@@ -219,6 +237,23 @@ export async function POST(req: Request) {
           answer: typeof c?.answer === "string" ? c.answer.trim() : "",
         }))
         .filter((c) => c.prompt.length > 0 && c.answer.length > 0);
+    }
+    // Strip the server's verified/matched annotations off the incoming plan by re-parsing it
+    // through the Zod schema — unknown keys are dropped, leaving a clean Itinerary to embed.
+    // If the instruction is empty/oversized or the plan doesn't parse, we ignore the refine
+    // and fall back to planning fresh from the brief.
+    if (body?.refine && typeof body.refine === "object") {
+      const r = body.refine as Record<string, unknown>;
+      const instruction = typeof r.instruction === "string" ? r.instruction.trim() : "";
+      const parsed = itinerarySchema.safeParse(r.itinerary);
+      if (
+        instruction.length > 0 &&
+        instruction.length <= MAX_BRIEF_CHARS &&
+        parsed.success &&
+        JSON.stringify(parsed.data).length <= MAX_REFINE_ITINERARY_CHARS
+      ) {
+        refine = { itinerary: parsed.data, instruction };
+      }
     }
   } catch {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
@@ -288,10 +323,29 @@ export async function POST(req: Request) {
           },
         );
       }
+      if (refine) {
+        // Cross-request state (the concierge step): seed the prior plan as a real assistant
+        // turn and the requested change as the next user turn, then let the loop below
+        // re-ground it from scratch. Because turn 0 still forces verify_places and the route
+        // turn is re-gated on the revised plan's distinct cities, a refine that changes
+        // cities re-detects multiCity and re-checks the route automatically. The client
+        // sends the LATEST plan (prior refines already baked in), so we don't replay history.
+        messages.push(
+          {
+            role: "assistant",
+            content: `Here's the itinerary I built:\n${JSON.stringify(refine.itinerary)}`,
+          },
+          { role: "user", content: refine.instruction },
+        );
+      }
       const verifyCache = new Map<string, VerifyResult>();
       let verifiedOnce = false; // have we run a real place-verification round yet?
       let routedOnce = false; // has the model used its one check_route round?
-      let multiCity = false; // does the verified plan span 2+ cities? (gates check_route)
+      // Does the plan span 2+ cities? Gates the check_route turn. Seed it from the prior
+      // plan on a refine so a multi-city refine still gets a route check even if the model's
+      // verify batch happens to under-represent the cities; the post-verify recompute below
+      // can only raise this floor, never lower it.
+      let multiCity = refine !== null && refine.itinerary.cities.length >= 2;
       let emptyVerifyCount = 0; // verify_places calls that arrived with nothing checkable
 
       try {
@@ -309,7 +363,12 @@ export async function POST(req: Request) {
           if (!verifiedOnce) {
             phase = "drafting";
             toolsForTurn = [VERIFY_PLACES_TOOL];
-            toolChoice = { type: "tool", name: "verify_places" };
+            // disable_parallel_tool_use forces exactly ONE verify_places call, so every place
+            // lands in a single batch. Without it the model can split a big plan into parallel
+            // verify calls; the loop handles one tool_use per turn, so the extra calls would be
+            // left without a tool_result and the API rejects the next turn. (Refines verify
+            // more places, which is what surfaced this.)
+            toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
           } else if (multiCity && !routedOnce) {
             // Offer {check_route, emit}; disable_parallel_tool_use makes the model pick
             // exactly ONE per response. The prompt steers a multi-city trip to call
@@ -322,7 +381,8 @@ export async function POST(req: Request) {
           } else {
             phase = "finalizing";
             toolsForTurn = [EMIT_ITINERARY_TOOL];
-            toolChoice = { type: "tool", name: "emit_itinerary" };
+            // Same single-tool-per-turn invariant: force exactly one emit_itinerary.
+            toolChoice = { type: "tool", name: "emit_itinerary", disable_parallel_tool_use: true };
           }
           send({ type: "status", phase });
 
@@ -400,8 +460,21 @@ export async function POST(req: Request) {
           }
 
           if (toolUse.name === "verify_places") {
-            const input = toolUse.input as { places?: Array<{ name?: unknown; city?: unknown }> };
-            const places = (input.places ?? [])
+            const input = toolUse.input as { places?: unknown };
+            // Tool inputs aren't strictly validated, so the model can return `places` as
+            // something other than an array (the larger refine context makes this more
+            // likely). Guard the type — a non-array falls into the empty-verify retry below
+            // instead of throwing. (`?? []` alone only guards null/undefined.)
+            if (input.places != null && !Array.isArray(input.places)) {
+              console.warn(
+                "verify_places: non-array places:",
+                JSON.stringify(input.places).slice(0, 300),
+              );
+            }
+            const rawPlaces = Array.isArray(input.places)
+              ? (input.places as Array<{ name?: unknown; city?: unknown }>)
+              : [];
+            const places = rawPlaces
               .filter(
                 (p): p is { name: string; city?: unknown } =>
                   !!p && typeof p.name === "string" && p.name.trim().length > 0,
@@ -455,15 +528,18 @@ export async function POST(req: Request) {
             const distinctCities = new Set(
               places.map((p) => (p.city ?? "").trim().toLowerCase()).filter(Boolean),
             );
-            multiCity = distinctCities.size >= 2;
+            multiCity = multiCity || distinctCities.size >= 2;
             continue; // back to the top — next turn the model checks the route or emits
           }
 
           if (toolUse.name === "check_route") {
-            const input = toolUse.input as {
-              cities?: Array<{ name?: unknown; country?: unknown }>;
-            };
-            const cities = (input.cities ?? [])
+            const input = toolUse.input as { cities?: unknown };
+            // Same guard as verify_places: a non-array `cities` shouldn't throw. An empty
+            // result just means checkRoute reports nothing to check and we move to emit.
+            const rawCities = Array.isArray(input.cities)
+              ? (input.cities as Array<{ name?: unknown; country?: unknown }>)
+              : [];
+            const cities = rawCities
               .filter(
                 (c): c is { name: string; country?: unknown } =>
                   !!c && typeof c.name === "string" && c.name.trim().length > 0,

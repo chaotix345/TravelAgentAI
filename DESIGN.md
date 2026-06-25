@@ -301,8 +301,25 @@ worth showing.
    keeping the 2-turn fast path); a new `routing` stream phase shows it live. Straight-line distance
    isn't travel time, but it reliably catches zig-zags — a real driving-duration API (OSRM) is a
    later upgrade, not a v1 dependency.
-9. Then the rest of the all-in-one vision: deals, concierge chat, booking — each a new
-   tool on the same agent.
+9. ✅ **Concierge / refine loop (v1.5+) — DONE.** After a plan is shown, the traveler can tweak
+   it in plain language ("swap Coimbra for Braga", "make day 2 lighter", "add a city") and get
+   back ONE revised, fully re-grounded plan (decisive — a revised plan, never a menu). Built by
+   extending `POST /api/plan` with an optional `refine: { itinerary, instruction }`: the server
+   strips its own `verified`/`matched` annotations off the incoming plan (`itinerarySchema.safeParse`
+   drops the unknown keys), seeds `[brief] (+ clarify) + [assistant: prior plan] + [user: change]`,
+   and runs the SAME forced-verify → optional-check_route → forced-emit loop — so the revision is
+   re-verified and re-routed when cities change (`multiCity` re-detected, with a floor seeded from
+   the prior plan's city count). State is client-held (the latest plan + the original brief/
+   clarifications), like the clarifications replay, so it stays stateless-serverless friendly. This
+   teaches the next agent concept: MULTI-TURN CONVERSATION STATE ACROSS REQUESTS (vs. the
+   within-request loop). Hardened in the same pass after live validation surfaced two latent bugs:
+   every turn now forces exactly ONE tool (`disable_parallel_tool_use`) so a big plan can't split
+   verify into parallel calls and orphan a tool_result (a 400); tool inputs are guarded against
+   non-array shapes; the request body is size-checked before parsing; and schema string fields are
+   length-bounded (the prior plan is user input embedded into the prompt). The system prompt gained
+   a "Refining a plan you already made" section: apply exactly the change, return the COMPLETE plan,
+   re-verify EVERY place (grounding doesn't carry over), update the summary, stay one plan.
+10. Then the rest of the all-in-one vision: deals and booking — each a new tool on the same agent.
 
 ## The Assignment
 
