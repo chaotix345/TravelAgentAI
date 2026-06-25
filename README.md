@@ -12,6 +12,10 @@ a free geo database (OpenStreetMap + Wikipedia) *and*, for a multi-city trip, ch
 real distances along the route — all in a single agent loop, streaming live progress and
 marking each activity confirmed-real in the UI.
 
+After the plan lands you can **refine it in plain language** — *"swap Coimbra for Braga",
+"make day 2 lighter", "add a city"* — and get back one revised, fully re-grounded plan
+(never a menu). That's the start of the **concierge** step in the product vision.
+
 ## Run it
 
 1. Install deps:
@@ -34,17 +38,23 @@ marking each activity confirmed-real in the UI.
 - **`app/page.tsx`** — the UI: one textarea, an optional clarifying-questions card, a
   live progress indicator (drafting → verifying *N/M* → routing *N/M cities* → finalizing),
   and the rendered itinerary with a **✓ real** badge on each verified place. It reads the
-  plan route's streamed events with a `fetch` + `ReadableStream` reader.
+  plan route's streamed events with a `fetch` + `ReadableStream` reader. Below a finished
+  plan, a **refine composer** (quick chips + a free-text box) sends a change back through the
+  same stream and repaints the revised plan in place.
 - **`app/api/clarify/route.ts`** — `POST /api/clarify` takes `{ brief }` and, on a fast
   cheap model (`claude-haiku-4-5`), decides whether to ask the traveler up to two quick
   questions (trip *depth*, *must-includes / hard no's*). Returns `{ questions: [...] }` —
   empty when the brief already settles things, so the common case plans instantly.
-- **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications? }` and
-  runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
+- **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications?, refine? }`
+  and runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
   *forced* to verify its named places first (`verify_places`); then, for a **multi-city**
   trip, it gets one turn to call `check_route` and react to the real distances; finally it
   is *forced* to emit the itinerary. A verification verdict is attached to each activity on
-  the server before it streams back.
+  the server before it streams back. When `refine` is present it carries the latest plan plus
+  a change; the route strips its own annotations off that plan, seeds it (and the change) into
+  the conversation, and runs the **same loop** — so the revision is re-verified and, if its
+  cities changed, re-routed. Every turn forces exactly one tool (`disable_parallel_tool_use`),
+  so a large plan can't split `verify_places` into parallel calls and orphan a tool result.
 - **`lib/verify.ts`** — executes the `verify_places` tool: checks each place against
   OpenStreetMap (Nominatim) with a Wikipedia fallback. Free, no API key, throttled to ~1
   request/second per OSM's usage policy. A **token-overlap guard** rejects loose matches
@@ -125,6 +135,28 @@ most two questions before planning — *deep (fewer cities, more nights) vs broa
 gets nothing, and plans immediately). The answers are replayed into the plan request as
 prior conversation turns, so the planner conditions on them (that's the multi-turn state).
 
+## Refining a plan (the concierge step)
+
+Once a plan is on screen, you can ask for a change in plain language and get back **one**
+revised plan — decisive, never a menu. The client sends `POST /api/plan` with
+`refine: { itinerary, instruction }`, where `itinerary` is the **latest** plan it's holding
+(prior tweaks already baked in, so there's no refine history to replay). The server:
+
+1. **Strips its own annotations** off the incoming plan by re-parsing it through the Zod
+   schema (`itinerarySchema.safeParse` drops the `verified`/`matched` keys), leaving a clean
+   `Itinerary` to embed. If the change is empty/oversized or the plan doesn't parse, it
+   ignores the refine and plans fresh.
+2. **Seeds the conversation** as `[user: brief] (+ clarify replay) + [assistant: the prior
+   plan] + [user: the change]`, then runs the **same** forced-verify → optional-check_route →
+   forced-emit loop. No second loop, no new endpoint.
+
+Because the loop is reused unchanged, a refine is **re-grounded** (every place re-verified)
+and **re-routed** whenever the cities change — `multiCity` is re-detected from the revised
+plan. This is the next concept past the within-request agent loop: **conversation state
+carried across requests**, held client-side (like the clarifications) so it stays
+stateless-serverless friendly. Each refine re-verifies the whole plan, so it costs about as
+much as the first plan — correct, just heavier; fine for v1.
+
 ## Model and cost
 
 The planner model is one constant in `app/api/plan/route.ts`:
@@ -167,5 +199,8 @@ small decision, not the planning).
    broad?" and "any must-include cities?" only when useful, then plans with the answers.
 4. ✅ **Ground the route — done.** A second tool, `check_route`, grounds the multi-city
    route in real geographic distances so the agent loop is genuinely multi-tool.
-5. Then the rest of the all-in-one vision: deals, concierge chat, booking — each a new
-   tool on the same agent.
+5. ✅ **Concierge / refine loop — done.** After a plan is shown, tweak it in plain language
+   ("swap a city", "lighter days", "add a city") and get back one revised, re-grounded plan.
+   Reuses the whole loop; teaches conversation state carried *across* requests.
+6. Then the rest of the all-in-one vision: deals and booking — each a new tool on the same
+   agent.

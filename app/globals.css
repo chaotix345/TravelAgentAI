@@ -354,3 +354,71 @@ button.link:hover {
   background: #f6ecd9;
   border: 1px solid #e6d2ad;
 }
+
+.refine {
+  margin-top: 32px;
+  padding: 20px 18px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.refine-head {
+  margin: 0 0 4px;
+  font-size: 1.05rem;
+}
+
+.refine-sub {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.refine-log {
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.refine-log li {
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding: 7px 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.refine-log li::before {
+  content: "✎ ";
+  color: var(--accent);
+}
+
+.refine .row {
+  margin-top: 12px;
+}
+
+.refine-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 0.95rem;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.refine-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.chip:disabled {
+  opacity: 0.55;
+  cursor: default;
+}

@@ -10,6 +10,9 @@ const MAX_BRIEF_CHARS = 4000;
 // heartbeat keeps this from tripping during a long drafting/routing/finalizing turn.
 const IDLE_TIMEOUT_MS = 45_000;
 const DEPTH_OPTIONS = ["Go deep", "Go broad", "You decide"];
+// One-tap refine presets. Each sends its own label as the change instruction; the planner
+// applies it and streams back a single re-grounded plan.
+const REFINE_CHIPS = ["Make it broader", "Make days lighter", "More food", "More nightlife"];
 
 // Mirror of the server's PlanEvent (app/api/plan/route.ts). Kept local so the client
 // bundle doesn't pull in server-only code.
@@ -33,6 +36,15 @@ type Progress =
   | { phase: "verifying"; done: number; total: number }
   | { phase: "routing"; done: number; total: number; name?: string };
 
+// What runPlan needs: the brief + clarifications context, and — for a concierge tweak — the
+// latest plan plus the change to apply. A refine reuses the ORIGINAL brief/clarifications so
+// it stays anchored to the trip's full context even if the textarea was edited afterwards.
+type RunPlanOpts = {
+  brief: string;
+  clarifications: Clarification[];
+  refine?: { itinerary: VerifiedItinerary; instruction: string };
+};
+
 export default function Home() {
   const [brief, setBrief] = useState("");
   const [loading, setLoading] = useState(false);
@@ -41,6 +53,13 @@ export default function Home() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const [questions, setQuestions] = useState<ClarifyQuestion[] | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  // Concierge/refine state. lastBrief + lastClarifications are the context that produced the
+  // current plan; refines replay them so each tweak builds on the original trip, not the
+  // (possibly edited) textarea. refineLog is the running list of tweaks already applied.
+  const [lastBrief, setLastBrief] = useState("");
+  const [lastClarifications, setLastClarifications] = useState<Clarification[]>([]);
+  const [refineLog, setRefineLog] = useState<string[]>([]);
+  const [refineText, setRefineText] = useState("");
 
   // Step 1: ask the intake step whether it wants to clarify anything. If it does, show the
   // questions and wait; if not (or it errors), go straight to planning.
@@ -49,6 +68,8 @@ export default function Home() {
     setError(null);
     setItinerary(null);
     setQuestions(null);
+    setRefineLog([]);
+    setRefineText("");
     setLoading(true);
 
     try {
@@ -68,23 +89,41 @@ export default function Home() {
     } catch {
       // Clarify is best-effort — fall through to planning.
     }
-    await runPlan([]);
+    await runPlan({ brief, clarifications: [] });
   }
 
   function onAnswersSubmit() {
+    if (loading) return;
     const qs = questions ?? [];
     const clarifications: Clarification[] = qs
       .map((q) => ({ prompt: q.prompt, answer: (answers[q.id] ?? "").trim() }))
       .filter((c) => c.answer.length > 0);
     setQuestions(null);
     setLoading(true);
-    void runPlan(clarifications);
+    void runPlan({ brief, clarifications });
   }
 
-  // Step 2: stream the plan. Reads the route's NDJSON events and drives the progress UI.
-  async function runPlan(clarifications: Clarification[]) {
+  // Concierge step: apply a change to the current plan. Sends the LATEST itinerary (prior
+  // tweaks are already baked in, so we don't replay the whole refine history) plus the new
+  // instruction; the server strips our annotations, re-grounds, and streams a revised plan
+  // in place. Empty/whitespace instructions are ignored here.
+  function onRefine(instruction: string) {
+    const text = instruction.trim();
+    if (!text || loading || !itinerary) return;
+    setRefineText("");
+    setLoading(true);
+    void runPlan({
+      brief: lastBrief,
+      clarifications: lastClarifications,
+      refine: { itinerary, instruction: text },
+    });
+  }
+
+  // Step 2: stream the plan (initial or refined). Reads the route's NDJSON events and drives
+  // the progress UI. A refine keeps the existing plan on screen while the new one streams.
+  async function runPlan(opts: RunPlanOpts) {
     setError(null);
-    setItinerary(null);
+    if (!opts.refine) setItinerary(null); // a refine re-streams in place — keep the old plan up
     setProgress({ phase: "drafting" });
 
     const controller = new AbortController();
@@ -102,7 +141,11 @@ export default function Home() {
       const res = await fetch("/api/plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ brief, clarifications }),
+        body: JSON.stringify({
+          brief: opts.brief,
+          clarifications: opts.clarifications,
+          refine: opts.refine,
+        }),
         signal: controller.signal,
       });
 
@@ -164,6 +207,14 @@ export default function Home() {
           } else if (evt.type === "itinerary") {
             setItinerary(evt.itinerary);
             gotItinerary = true;
+            // Remember the context that produced this plan so later refines stay anchored to
+            // it. For a refine, record the tweak in the running log.
+            setLastBrief(opts.brief);
+            setLastClarifications(opts.clarifications);
+            if (opts.refine) {
+              const applied = opts.refine.instruction;
+              setRefineLog((log) => [...log, applied]);
+            }
           } else if (evt.type === "error") {
             setError(evt.message);
             gotError = true;
@@ -241,11 +292,13 @@ export default function Home() {
           questions={questions}
           answers={answers}
           setAnswers={setAnswers}
+          loading={loading}
           onSubmit={onAnswersSubmit}
           onSkip={() => {
+            if (loading) return;
             setQuestions(null);
             setLoading(true);
-            void runPlan([]);
+            void runPlan({ brief, clarifications: [] });
           }}
         />
       )}
@@ -258,6 +311,16 @@ export default function Home() {
       {loading && <ProgressView progress={progress} />}
 
       {itinerary && <Plan itinerary={itinerary} />}
+
+      {itinerary && (
+        <RefineComposer
+          log={refineLog}
+          value={refineText}
+          setValue={setRefineText}
+          onRefine={onRefine}
+          loading={loading}
+        />
+      )}
     </main>
   );
 }
@@ -266,12 +329,14 @@ function ClarifyForm({
   questions,
   answers,
   setAnswers,
+  loading,
   onSubmit,
   onSkip,
 }: {
   questions: ClarifyQuestion[];
   answers: Record<string, string>;
   setAnswers: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  loading: boolean;
   onSubmit: () => void;
   onSkip: () => void;
 }) {
@@ -306,10 +371,10 @@ function ClarifyForm({
         </div>
       ))}
       <div className="row">
-        <button className="go" type="button" onClick={onSubmit}>
+        <button className="go" type="button" onClick={onSubmit} disabled={loading}>
           Plan my trip
         </button>
-        <button className="link" type="button" onClick={onSkip}>
+        <button className="link" type="button" onClick={onSkip} disabled={loading}>
           Skip, just plan it
         </button>
       </div>
@@ -413,5 +478,79 @@ function Slot({ when, act }: { when: string; act: VerifiedActivity }) {
         {act.why && <div className="act-why">{act.why}</div>}
       </div>
     </div>
+  );
+}
+
+// The concierge composer: ask for a change and get back one re-grounded plan. Chips are
+// one-tap presets; the input takes anything ("swap Coimbra for Braga", "drop a city"). Both
+// route through onRefine, which re-runs the whole verify → route → emit loop server-side.
+function RefineComposer({
+  log,
+  value,
+  setValue,
+  onRefine,
+  loading,
+}: {
+  log: string[];
+  value: string;
+  setValue: (v: string) => void;
+  onRefine: (instruction: string) => void;
+  loading: boolean;
+}) {
+  return (
+    <section className="refine">
+      <h3 className="refine-head">Want to tweak it?</h3>
+      <p className="refine-sub">
+        Ask for a change and I&apos;ll hand back one revised plan, re-checked and re-routed.
+      </p>
+
+      {log.length > 0 && (
+        <ul className="refine-log">
+          {log.map((t, i) => (
+            <li key={`${i}-${t}`}>{t}</li>
+          ))}
+        </ul>
+      )}
+
+      <div className="chips">
+        {REFINE_CHIPS.map((c) => (
+          <button
+            key={c}
+            type="button"
+            className="chip"
+            disabled={loading}
+            onClick={() => onRefine(c)}
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+
+      <div className="row">
+        <input
+          type="text"
+          className="refine-input"
+          aria-label="Describe a change to your plan"
+          value={value}
+          disabled={loading}
+          placeholder="e.g. swap Coimbra for Braga, make day 2 lighter, add a city…"
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onRefine(value);
+            }
+          }}
+        />
+        <button
+          className="go"
+          type="button"
+          disabled={loading || !value.trim()}
+          onClick={() => onRefine(value)}
+        >
+          {loading ? "Refining…" : "Refine"}
+        </button>
+      </div>
+    </section>
   );
 }
