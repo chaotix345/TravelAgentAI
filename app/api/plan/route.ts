@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import {
   itineraryJsonSchema,
   itinerarySchema,
+  type BudgetSummary,
   type Itinerary,
   type VerifiedItinerary,
   type VerifyStatus,
@@ -10,6 +11,7 @@ import {
 import { SYSTEM_PROMPT } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
+import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
 
 // The Anthropic SDK needs the Node runtime (not edge).
 export const runtime = "nodejs";
@@ -33,14 +35,15 @@ const MAX_REFINE_ITINERARY_CHARS = 200_000;
 // handlers have no built-in body-size limit). Generous enough for a brief + a fully
 // annotated prior plan, but stops a multi-MB body from being buffered and parsed at all.
 const MAX_BODY_CHARS = 1_000_000;
-// Backstop on agent-loop iterations. Happy path: 2 model turns for a single city
-// (verify, then a forced emit) and 3 for a multi-city trip (verify, an optional
-// check_route, then a forced emit). We allow the model ONE retry if it calls
-// verify with no usable places (capped below by EMPTY_VERIFY_RETRIES), so the
-// worst legitimate path is verify-retry -> verify -> check_route -> emit = 4
-// turns and still fits. Guards against anything unexpected so a request can't
-// spin forever.
-const MAX_TURNS = 4;
+// Backstop on agent-loop iterations. Happy path: 2 model turns for a single-city trip with no
+// budget angle (verify, then a forced emit), or 3 if it prices (verify -> estimate_costs -> emit).
+// A multi-city trip adds an optional check_route, which runs before cost (verify -> check_route ->
+// estimate_costs -> emit = 4). We allow the model ONE retry if it calls verify with no usable
+// places (capped below by EMPTY_VERIFY_RETRIES), so the worst legitimate path is verify-retry ->
+// verify -> check_route -> estimate_costs -> emit = 5 turns; 6 leaves a turn of headroom. Each
+// optional tool is gated to one use, so the loop can't spin. Guards against anything unexpected so
+// a request can't run forever.
+const MAX_TURNS = 6;
 // How many times the model may call verify_places with nothing checkable before
 // we give up with a clear error (instead of silently burning the turn budget).
 const EMPTY_VERIFY_RETRIES = 1;
@@ -132,6 +135,37 @@ const CHECK_ROUTE_TOOL: Anthropic.Tool = {
   } as Anthropic.Tool.InputSchema,
 };
 
+const ESTIMATE_COSTS_TOOL: Anthropic.Tool = {
+  name: "estimate_costs",
+  description:
+    "Ground the BUDGET of your plan in real cost data. Pass your cities (with country and the nights you plan in each) and the traveler's travel style. Returns, per city, a cost level (cheap/moderate/pricey/expensive) and a realistic per-person daily spend for that style — derived from World Bank price-level data — plus real example prices pulled from Wikivoyage, and a total estimate. Use it to right-size nights to the budget, flag or swap an expensive base, and tell the traveler where to save. Figures cover lodging, food, local transport and activities per person; they exclude flights and intercity transport. Call this when budget matters — the brief mentions a budget, money, or 'cheap/mid/luxury', or it's a longer or multi-city trip where cost shapes the decisions. There's no reliable free source for live flight or hotel prices, so this grounds cost LEVEL, not live quotes — never invent exact prices yourself.",
+  input_schema: {
+    type: "object",
+    properties: {
+      style: {
+        type: "string",
+        enum: ["budget", "mid-range", "luxury"],
+        description: "The traveler's travel style, inferred from the brief. Default mid-range.",
+      },
+      cities: {
+        type: "array",
+        minItems: 1,
+        description: "Your cities, with the nights you plan in each.",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "City name." },
+            country: { type: "string", description: "Country (to locate cost data)." },
+            nights: { type: "number", description: "Nights you plan to spend in this city." },
+          },
+          required: ["name", "country", "nights"],
+        },
+      },
+    },
+    required: ["style", "cities"],
+  } as Anthropic.Tool.InputSchema,
+};
+
 const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
   name: "emit_itinerary",
   description:
@@ -146,7 +180,7 @@ const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -170,6 +204,10 @@ const norm = (s: string) =>
 function annotateItinerary(
   itinerary: Itinerary,
   cache: Map<string, VerifyResult>,
+  // The last estimate_costs result, if the agent ran one. We attach the budget the TOOL
+  // computed — not anything the model wrote — so the displayed numbers are grounded, the same
+  // way the verify verdict is ours. null when the agent didn't price the trip.
+  costEstimate: CostEstimate | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -190,18 +228,55 @@ function annotateItinerary(
     }
     return unconfirmed ? { verified: "unconfirmed" } : {};
   };
-  return {
-    ...itinerary,
-    cities: itinerary.cities.map((city) => ({
+  // Index the tool's per-city cost by folded city name so we can hang it on the matching city.
+  const costByCity = new Map<string, CityCost>();
+  if (costEstimate) for (const c of costEstimate.cities) costByCity.set(norm(c.name), c);
+
+  // Build the cities, collecting the per-city costs that actually matched a city in the FINAL
+  // plan. We recompute the headline budget from just these, so the total always equals the sum of
+  // the per-city figures shown — even if the model changed the city set between pricing and emit.
+  const matched: CityCost[] = [];
+  const cities = itinerary.cities.map((city) => {
+    const cc = costByCity.get(norm(city.name));
+    if (cc) matched.push(cc);
+    return {
       ...city,
+      ...(cc ? { cost: { tier: cc.tier, dailyUsd: cc.dailyUsd, anchors: cc.anchors } } : {}),
       days: city.days.map((day) => ({
         label: day.label,
         morning: { ...day.morning, ...verdict(day.morning.name) },
         afternoon: { ...day.afternoon, ...verdict(day.afternoon.name) },
         evening: { ...day.evening, ...verdict(day.evening.name) },
       })),
-    })),
-  };
+    };
+  });
+
+  // Attach a budget only if priced cities actually appear in the plan — this drops a vacuous
+  // estimate (an empty/zero-city cost call) and ignores any city the model priced but then cut.
+  let budget: BudgetSummary | undefined;
+  if (costEstimate && matched.length > 0) {
+    const priced = matched.filter((c) => c.subtotalUsd != null);
+    const totalUsd =
+      priced.length > 0 ? priced.reduce((sum, c) => sum + (c.subtotalUsd ?? 0), 0) : null;
+    const totalNights = priced.reduce((sum, c) => sum + c.nights, 0);
+    // Null the per-day headline when a shown city couldn't be priced — otherwise it reads as a
+    // whole-trip daily rate while silently excluding the unpriced nights.
+    const hasUnpriced = matched.some((c) => c.subtotalUsd == null);
+    const perDayUsd =
+      totalUsd != null && totalNights > 0 && !hasUnpriced
+        ? Math.round(totalUsd / totalNights)
+        : null;
+    budget = {
+      style: costEstimate.style,
+      currency: costEstimate.currency,
+      totalUsd,
+      perDayUsd,
+      note: costEstimate.note,
+      flags: costEstimate.flags,
+    };
+  }
+
+  return { ...itinerary, ...(budget ? { budget } : {}), cities };
 }
 
 export async function POST(req: Request) {
@@ -341,6 +416,9 @@ export async function POST(req: Request) {
       const verifyCache = new Map<string, VerifyResult>();
       let verifiedOnce = false; // have we run a real place-verification round yet?
       let routedOnce = false; // has the model used its one check_route round?
+      let costedOnce = false; // has the model used its one estimate_costs round?
+      // The grounded budget from the last estimate_costs call, attached to the final plan.
+      let costEstimate: CostEstimate | null = null;
       // Does the plan span 2+ cities? Gates the check_route turn. Seed it from the prior
       // plan on a refine so a multi-city refine still gets a route check even if the model's
       // verify batch happens to under-represent the cities; the post-verify recompute below
@@ -357,7 +435,7 @@ export async function POST(req: Request) {
           // a multi-city trip gets ONE optional check_route turn (the model chooses
           // route-or-emit), then emit is forced. Single-city trips skip straight to a
           // forced emit: there's no route to check.
-          let phase: "drafting" | "routing" | "finalizing";
+          let phase: "drafting" | "routing" | "pricing" | "finalizing";
           let toolsForTurn: Anthropic.Tool[];
           let toolChoice: Anthropic.ToolChoice;
           if (!verifiedOnce) {
@@ -369,20 +447,36 @@ export async function POST(req: Request) {
             // left without a tool_result and the API rejects the next turn. (Refines verify
             // more places, which is what surfaced this.)
             toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
-          } else if (multiCity && !routedOnce) {
-            // Offer {check_route, emit}; disable_parallel_tool_use makes the model pick
-            // exactly ONE per response. The prompt steers a multi-city trip to call
-            // check_route here, but the model MAY emit directly if it judges the route
-            // already clean — check_route is the agent's choice, not forced. (verify_places
-            // stays the forced, sole tool on turn 0, so place-grounding is still structural.)
-            phase = "routing";
-            toolsForTurn = [CHECK_ROUTE_TOOL, EMIT_ITINERARY_TOOL];
-            toolChoice = { type: "any", disable_parallel_tool_use: true };
           } else {
-            phase = "finalizing";
-            toolsForTurn = [EMIT_ITINERARY_TOOL];
-            // Same single-tool-per-turn invariant: force exactly one emit_itinerary.
-            toolChoice = { type: "tool", name: "emit_itinerary", disable_parallel_tool_use: true };
+            // Places are grounded. Offer the OPTIONAL grounding tools the agent hasn't spent
+            // yet — check_route (multi-city only) and estimate_costs — alongside emit, and let
+            // the model choose (the prompt steers when each earns its turn). Each is gated to a
+            // single use, so the loop can't spin: at most one route turn + one cost turn before
+            // emit. disable_parallel_tool_use keeps it to exactly one tool_use per response, the
+            // same invariant every other turn relies on. When no optional tool is left, force
+            // the final emit. (verify_places stays the sole forced tool on turn 0, so place
+            // grounding is still structural — only route/cost are the agent's call.)
+            const optional: Anthropic.Tool[] = [];
+            if (multiCity && !routedOnce) optional.push(CHECK_ROUTE_TOOL);
+            // Offer cost only once the route is settled (or there's no route to settle), so the
+            // budget is computed against the FINAL city set — not one check_route may still
+            // reorder or drop. Enforces the prompt's "price once the cities are settled" at the
+            // loop level instead of trusting the model to sequence it.
+            if (!costedOnce && (!multiCity || routedOnce)) optional.push(ESTIMATE_COSTS_TOOL);
+            if (optional.length > 0) {
+              // Pre-decision label: name the work most likely to run next so the UI shows a
+              // sensible phase before the model picks. Routing comes first on a multi-city trip;
+              // otherwise the only optional tool on offer is cost. The precise per-tool status
+              // fires when the chosen tool actually runs (or finalizing if it emits instead).
+              phase = multiCity && !routedOnce ? "routing" : "pricing";
+              toolsForTurn = [...optional, EMIT_ITINERARY_TOOL];
+              toolChoice = { type: "any", disable_parallel_tool_use: true };
+            } else {
+              phase = "finalizing";
+              toolsForTurn = [EMIT_ITINERARY_TOOL];
+              // Same single-tool-per-turn invariant: force exactly one emit_itinerary.
+              toolChoice = { type: "tool", name: "emit_itinerary", disable_parallel_tool_use: true };
+            }
           }
           send({ type: "status", phase });
 
@@ -455,7 +549,13 @@ export async function POST(req: Request) {
               ...parsed.data,
               totalNights: parsed.data.cities.reduce((sum, c) => sum + c.nights, 0),
             };
-            send({ type: "itinerary", itinerary: annotateItinerary(itinerary, verifyCache) });
+            // If the model emitted straight off an optional turn (pricing/routing was the last
+            // label), transition cleanly to finalizing before the plan paints.
+            send({ type: "status", phase: "finalizing" });
+            send({
+              type: "itinerary",
+              itinerary: annotateItinerary(itinerary, verifyCache, costEstimate),
+            });
             return;
           }
 
@@ -562,7 +662,62 @@ export async function POST(req: Request) {
               ],
             });
             routedOnce = true;
-            continue; // back to the top — next turn we force the final itinerary
+            continue; // back to the top — next turn the model prices or emits
+          }
+
+          if (toolUse.name === "estimate_costs") {
+            const input = toolUse.input as { style?: unknown; cities?: unknown };
+            const style = parseStyle(input.style);
+            // Same defensive guard as the other tools: a non-array `cities` shouldn't throw.
+            const rawCities = Array.isArray(input.cities)
+              ? (input.cities as Array<{ name?: unknown; country?: unknown; nights?: unknown }>)
+              : [];
+            const cities = rawCities
+              .filter(
+                (c): c is { name: string; country?: unknown; nights?: unknown } =>
+                  !!c && typeof c.name === "string" && c.name.trim().length > 0,
+              )
+              .map((c) => ({
+                name: c.name.trim(),
+                country: typeof c.country === "string" ? c.country.trim() : undefined,
+                nights:
+                  typeof c.nights === "number" && Number.isFinite(c.nights) ? c.nights : 1,
+              }));
+
+            if (cities.length === 0) {
+              // Nothing priceable. Consume the option (so we don't re-offer and risk a loop) and
+              // move on WITHOUT a budget rather than attach a vacuous "grounded" one.
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content:
+                      "No valid cities were provided to price. Emit the plan without a budget.",
+                  },
+                ],
+              });
+              costedOnce = true;
+              continue;
+            }
+
+            send({ type: "status", phase: "pricing", done: 0, total: cities.length });
+            const estimate = await estimateCosts(
+              cities,
+              style,
+              (done, total, name) => send({ type: "status", phase: "pricing", done, total, name }),
+              req.signal,
+            );
+            costEstimate = estimate; // attached to the final plan as the grounded budget
+            messages.push({
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(estimate) },
+              ],
+            });
+            costedOnce = true;
+            continue; // back to the top — next turn the model checks the route or emits
           }
 
           // Unknown tool name — bail rather than loop forever.

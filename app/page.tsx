@@ -1,7 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import type { VerifiedItinerary, VerifiedDay, VerifiedActivity } from "@/lib/schema";
+import type {
+  VerifiedItinerary,
+  VerifiedDay,
+  VerifiedActivity,
+  VerifiedCity,
+  BudgetSummary,
+} from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
 
 const MAX_BRIEF_CHARS = 4000;
@@ -19,7 +25,7 @@ const REFINE_CHIPS = ["Make it broader", "Make days lighter", "More food", "More
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -34,7 +40,7 @@ type Clarification = { prompt: string; answer: string };
 type Progress =
   | { phase: "drafting" | "finalizing" }
   | { phase: "verifying"; done: number; total: number }
-  | { phase: "routing"; done: number; total: number; name?: string };
+  | { phase: "routing" | "pricing"; done: number; total: number; name?: string };
 
 // What runPlan needs: the brief + clarifications context, and — for a concierge tweak — the
 // latest plan plus the change to apply. A refine reuses the ORIGINAL brief/clarifications so
@@ -189,15 +195,16 @@ export default function Home() {
           if (evt.type === "status") {
             if (evt.phase === "verifying") {
               setProgress({ phase: "verifying", done: evt.done ?? 0, total: evt.total ?? 0 });
-            } else if (evt.phase === "routing") {
-              // Heartbeats during the route turn carry no counts — don't let them blank an
-              // active geocoding bar; keep the last routing counts until a real tick lands.
+            } else if (evt.phase === "routing" || evt.phase === "pricing") {
+              // Heartbeats during the route/cost turn carry no counts — don't let them blank an
+              // active bar; keep the last counts for this phase until a real tick lands.
+              const ph = evt.phase;
               setProgress((prev) =>
                 evt.total && evt.total > 0
-                  ? { phase: "routing", done: evt.done ?? 0, total: evt.total, name: evt.name }
-                  : prev && prev.phase === "routing"
+                  ? { phase: ph, done: evt.done ?? 0, total: evt.total, name: evt.name }
+                  : prev && prev.phase === ph
                     ? prev
-                    : { phase: "routing", done: 0, total: 0 },
+                    : { phase: ph, done: 0, total: 0 },
               );
             } else {
               setProgress({ phase: evt.phase });
@@ -394,10 +401,19 @@ function ProgressView({ progress }: { progress: Progress | null }) {
                 progress.name ? ` · ${progress.name}` : ""
               }`
             : "Sanity-checking the route…"
-          : "Finalizing your itinerary…";
+          : progress.phase === "pricing"
+            ? progress.total > 0
+              ? `Pricing the trip… ${progress.done}/${progress.total} cities${
+                  progress.name ? ` · ${progress.name}` : ""
+                }`
+              : "Pricing the trip…"
+            : "Finalizing your itinerary…";
 
   const pct =
-    (progress?.phase === "verifying" || progress?.phase === "routing") && progress.total > 0
+    (progress?.phase === "verifying" ||
+      progress?.phase === "routing" ||
+      progress?.phase === "pricing") &&
+    progress.total > 0
       ? Math.round((progress.done / progress.total) * 100)
       : null;
 
@@ -424,12 +440,15 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
         {itinerary.cities.length} {itinerary.cities.length === 1 ? "city" : "cities"} · {itinerary.totalNights} nights
       </p>
 
+      {itinerary.budget && <BudgetBlock budget={itinerary.budget} />}
+
       {itinerary.cities.map((city, i) => (
         <article className="city" key={`${city.name}-${i}`}>
           <div className="city-head">
             <h2>
               {city.name}
               {city.country ? `, ${city.country}` : ""} <span className="nights">· {city.nights} nights</span>
+              <CityCostChip city={city} />
             </h2>
             {city.why && <p className="why">{city.why}</p>}
           </div>
@@ -439,6 +458,55 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
         </article>
       ))}
     </section>
+  );
+}
+
+// The grounded budget, server-attached from the estimate_costs tool. Like the "✓ real" badge,
+// these are the tool's numbers, not the model's — hence the "grounded" badge and the note on
+// what's included. Shows only when the agent priced the trip.
+function BudgetBlock({ budget }: { budget: BudgetSummary }) {
+  const styleLabel = budget.style === "mid-range" ? "mid-range" : budget.style;
+  return (
+    <div className="budget">
+      <div className="budget-head">
+        <span className="budget-amount">
+          {budget.totalUsd != null ? `Est. ~$${budget.totalUsd.toLocaleString()}` : "Budget estimate"}
+        </span>
+        <span className="budget-sub">
+          {styleLabel} · per person{budget.perDayUsd != null ? ` · ~$${budget.perDayUsd}/day` : ""}
+        </span>
+        <span
+          className="badge ok"
+          tabIndex={0}
+          title="Grounded in World Bank price levels and Wikivoyage — a planning ballpark, not a live quote"
+        >
+          grounded
+        </span>
+      </div>
+      {budget.flags.length > 0 && (
+        <ul className="budget-flags">
+          {budget.flags.map((f) => (
+            <li key={f}>{f}</li>
+          ))}
+        </ul>
+      )}
+      <p className="budget-note">{budget.note}</p>
+    </div>
+  );
+}
+
+function CityCostChip({ city }: { city: VerifiedCity }) {
+  const cost = city.cost;
+  if (!cost || cost.tier === "unknown") return null;
+  const title =
+    cost.anchors.length > 0
+      ? `Example prices (Wikivoyage): ${cost.anchors.join(" · ")}`
+      : "Cost level from World Bank price-level data";
+  return (
+    <span className={`cost-chip ${cost.tier}`} tabIndex={0} title={title}>
+      {cost.tier}
+      {cost.dailyUsd != null ? ` · ~$${cost.dailyUsd}/day` : ""}
+    </span>
   );
 }
 
