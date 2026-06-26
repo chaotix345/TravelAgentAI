@@ -33,6 +33,12 @@ export type CityCost = {
   // style. null when we have no price level for the country.
   dailyUsd: number | null;
   subtotalUsd: number | null; // dailyUsd * nights
+  // Home-currency conversions of the two figures above. estimateCosts() leaves these undefined —
+  // it stays a pure, offline, USD-only computation. The route fills them in afterwards via
+  // lib/currency.ts (applyFxToCost) once it knows the live ECB rate, the same way verify verdicts
+  // are attached after the fact. undefined/null → no conversion ran (degrade to native USD).
+  dailyHome?: number | null;
+  subtotalHome?: number | null;
   priceLevel: number | null; // World Bank ratio, US = 1.0
   anchors: string[]; // verbatim real price snippets pulled from Wikivoyage
   source: "worldbank" | "none"; // where the tier/daily figure came from
@@ -40,12 +46,21 @@ export type CityCost = {
 
 export type CostEstimate = {
   style: CostStyle;
-  currency: "USD";
+  // The native currency the figures below are computed in. estimateCosts() always returns "USD"
+  // (World Bank price levels are USD-denominated); the type is `string` so the route can carry a
+  // converted estimate through the same shape. The home-currency fields live alongside.
+  currency: string;
   cities: CityCost[];
   totalUsd: number | null; // sum of per-city subtotals (per person), null if nothing priced
   perDayUsd: number | null; // total / total nights, a headline daily figure
   flags: string[];
   note: string;
+  // Filled by the route's FX pass (lib/currency.ts), not by estimateCosts. Absent → no conversion.
+  homeCurrency?: string;
+  totalHome?: number | null;
+  perDayHome?: number | null;
+  rate?: number;
+  rateDate?: string;
 };
 
 // --- Heuristics (tunable, like route.ts's distance thresholds) -------------------------------

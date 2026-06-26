@@ -59,6 +59,17 @@ Using find_flights well:
 - Some results come back flagged as TEST DATA — synthetic fares from a test airline, not real prices. When so, you may say a sample fare exists but make clear it is illustrative only; never present a test fare as a real quote. As with every tool, only ever cite a fare the tool actually returned, never a number from your own memory.
 - When REFINING a plan that already showed flights, or when the change touches the origin, the cities you fly in or out of, or the travel month, call find_flights again — grounding doesn't carry over between requests. Skip it only for a change that can't affect the fare.`;
 
+// Appended to the system prompt when the traveler's home currency isn't USD, so the model cites
+// the converted figures the tool results now carry rather than the raw USD/Duffel numbers. Cost and
+// fare grounding is unchanged; this only steers which currency the model SAYS in its prose, so it
+// matches the home-currency budget/fare blocks the UI renders. (When home is USD there's nothing to
+// convert and the clause is omitted — the byte-for-byte original behaviour.)
+export function currencyClause(home: string): string {
+  return `
+
+Currency note: the traveler's home currency is ${home}. Cost and flight figures in the tool results are converted to ${home} at a live European Central Bank reference rate WHEN AVAILABLE, and the traveler sees ${home} in the plan. When you mention a budget or fare in your summary, cite the ${home} amount as the primary figure; if you also name the original currency, put it only in parentheses AFTER the ${home} figure (e.g. "£66 (A$126)"), never as the headline. If a tool result says conversion was unavailable (the figures came back in their original currency), cite those original figures instead. Only ever cite a figure a tool actually returned — never one from your own memory.`;
+}
+
 // The intake step. Runs once, before planning, on a fast/cheap model. Its whole job is to
 // decide whether asking the traveler one or two quick questions would make a materially
 // better plan — and to lean hard toward NOT asking, because the planner's personality is

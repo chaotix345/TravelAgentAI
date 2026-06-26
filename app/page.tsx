@@ -357,7 +357,12 @@ export default function Home() {
           Duffel
         </a>{" "}
         key is configured, come from its flight-search API — test-mode fares are illustrative, not
-        real quotes. A planning aid, not a booking service.
+        real quotes. When a figure&apos;s currency differs from your home currency, it&apos;s
+        converted at{" "}
+        <a href="https://frankfurter.dev" target="_blank" rel="noreferrer noopener">
+          European Central Bank reference rates
+        </a>{" "}
+        (when available). A planning aid, not a booking service.
       </footer>
     </main>
   );
@@ -490,7 +495,7 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
             <h2>
               {city.name}
               {city.country ? `, ${city.country}` : ""} <span className="nights">· {city.nights} nights</span>
-              <CityCostChip city={city} />
+              <CityCostChip city={city} homeCurrency={itinerary.budget?.homeCurrency} />
             </h2>
             {city.why && <p className="why">{city.why}</p>}
           </div>
@@ -511,14 +516,34 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
 // what's included. Shows only when the agent priced the trip.
 function BudgetBlock({ budget }: { budget: BudgetSummary }) {
   const styleLabel = budget.style === "mid-range" ? "mid-range" : budget.style;
+  // Show the home-currency figure as the headline and the native (USD) figure quietly beside it,
+  // but only when a conversion actually ran (home differs from native and the rate landed). Falls
+  // back to the native USD figure when FX was a no-op or failed — graceful degradation in the UI.
+  const converted =
+    budget.homeCurrency != null &&
+    budget.totalHome != null &&
+    budget.homeCurrency !== budget.currency;
+  const totalText = converted
+    ? `Est. ~${fmtMoney(budget.totalHome!, budget.homeCurrency!)}`
+    : budget.totalUsd != null
+      ? `Est. ~${fmtMoney(budget.totalUsd, budget.currency)}`
+      : "Budget estimate";
+  const nativeTotal =
+    converted && budget.totalUsd != null ? `~${fmtMoney(budget.totalUsd, budget.currency)}` : null;
+  const perDayText = converted
+    ? budget.perDayHome != null
+      ? `~${fmtMoney(budget.perDayHome, budget.homeCurrency!)}/day`
+      : ""
+    : budget.perDayUsd != null
+      ? `~${fmtMoney(budget.perDayUsd, budget.currency)}/day`
+      : "";
   return (
     <div className="budget">
       <div className="budget-head">
-        <span className="budget-amount">
-          {budget.totalUsd != null ? `Est. ~$${budget.totalUsd.toLocaleString()}` : "Budget estimate"}
-        </span>
+        <span className="budget-amount">{totalText}</span>
+        {nativeTotal && <span className="budget-native">{nativeTotal}</span>}
         <span className="budget-sub">
-          {styleLabel} · per person{budget.perDayUsd != null ? ` · ~$${budget.perDayUsd}/day` : ""}
+          {styleLabel} · per person{perDayText ? ` · ${perDayText}` : ""}
         </span>
         <span
           className="badge ok"
@@ -536,13 +561,48 @@ function BudgetBlock({ budget }: { budget: BudgetSummary }) {
         </ul>
       )}
       <p className="budget-note">{budget.note}</p>
+      {converted && budget.rate != null && (
+        <FxNote native={budget.currency} home={budget.homeCurrency!} rate={budget.rate} date={budget.rateDate} />
+      )}
     </div>
   );
 }
 
+// The exchange-rate provenance line, shown under a converted budget or fare. Like the climate
+// CC-BY footer, it's honest about where the number came from — the ECB reference rate and its date
+// — so a converted figure is never a mystery. Rendered only when a conversion actually happened.
+function FxNote({
+  native,
+  home,
+  rate,
+  date,
+}: {
+  native: string;
+  home: string;
+  rate: number;
+  date?: string;
+}) {
+  return (
+    <p className="fx-note">
+      Converted from {native} at the European Central Bank reference rate (1 {native} ={" "}
+      {rate.toLocaleString(undefined, { maximumFractionDigits: 4 })} {home}
+      {date ? `, ${date}` : ""}) via Frankfurter.
+    </p>
+  );
+}
+
+// Display symbols for the currencies Duffel quotes and the ECB set we convert into. Kept here
+// (not imported from lib/currency.ts) so the client bundle pulls no server-only FX code — the same
+// import-free discipline the schema types follow. Unknown codes fall back to the bare code.
 const CURRENCY_SYMBOL: Record<string, string> = {
   USD: "$", GBP: "£", EUR: "€", JPY: "¥", CAD: "C$", AUD: "A$", CHF: "CHF ", INR: "₹",
+  NZD: "NZ$", SGD: "S$", HKD: "HK$", CNY: "¥", SEK: "kr ", NOK: "kr ", DKK: "kr ",
+  PLN: "zł ", CZK: "Kč ", THB: "฿", ZAR: "R ", MXN: "MX$", BRL: "R$", KRW: "₩",
 };
+function fmtMoney(n: number, code: string): string {
+  const sym = CURRENCY_SYMBOL[code] ?? (code ? `${code} ` : "$");
+  return `${sym}${n.toLocaleString()}`;
+}
 
 // The grounded flights, server-attached from the find_flights (Duffel) tool — the FIRST keyed
 // tool. Like the budget and season, the price shown is the tool's, not the model's. In Duffel TEST
@@ -551,9 +611,17 @@ const CURRENCY_SYMBOL: Record<string, string> = {
 // flights, which only happens when a Duffel key is configured (the graceful-degradation gate).
 function FlightsBlock({ flights }: { flights: FlightSummary }) {
   const code = flights.currency ?? "";
-  const money = (n: number) =>
-    `${CURRENCY_SYMBOL[code] ?? (code ? code + " " : "$")}${n.toLocaleString()}`;
-  const amount = flights.totalAmount != null ? money(flights.totalAmount) : "Fare estimate";
+  // Lead with the home-currency fare and keep Duffel's native quote beside it — this is what turns
+  // a stray "A$126" sandbox fare into "≈ £66 (A$126)". Show native-only when no conversion ran.
+  const converted =
+    flights.homeCurrency != null &&
+    flights.homeAmount != null &&
+    flights.homeCurrency !== flights.currency;
+  const nativeText = flights.totalAmount != null ? fmtMoney(flights.totalAmount, code) : null;
+  const amount = converted
+    ? fmtMoney(flights.homeAmount!, flights.homeCurrency!)
+    : (nativeText ?? "Fare estimate");
+  const nativeBeside = converted ? nativeText : null;
 
   const legs = flights.legs;
   // A symmetric there-and-back (same airports both ways) reads as "London ⇄ Lisbon"; an open-jaw
@@ -573,6 +641,7 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
     <div className="flights">
       <div className="flights-head">
         <span className="flights-amount">{amount}</span>
+        {nativeBeside && <span className="flights-native">{nativeBeside}</span>}
         <span className="flights-sub">
           round trip · per person{flights.airline ? ` · ${flights.airline}` : ""}
         </span>
@@ -596,13 +665,27 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
       </div>
       {route && <p className="flights-route">{route}</p>}
       <p className="flights-note">{flights.note}</p>
+      {converted && flights.rate != null && (
+        <FxNote
+          native={flights.currency ?? ""}
+          home={flights.homeCurrency!}
+          rate={flights.rate}
+          date={flights.rateDate}
+        />
+      )}
     </div>
   );
 }
 
-function CityCostChip({ city }: { city: VerifiedCity }) {
+function CityCostChip({ city, homeCurrency }: { city: VerifiedCity; homeCurrency?: string }) {
   const cost = city.cost;
   if (!cost || cost.tier === "unknown") return null;
+  // Prefer the home-currency daily figure (when converted); fall back to the native USD one. The
+  // Wikivoyage anchor prices in the tooltip stay in their own local currency — they're verbatim
+  // real examples, not converted figures, so we leave them as sourced.
+  const useHome = cost.dailyHome != null && homeCurrency != null;
+  const daily = useHome ? cost.dailyHome! : cost.dailyUsd;
+  const dailyCode = useHome ? homeCurrency! : "USD";
   const title =
     cost.anchors.length > 0
       ? `Example prices (Wikivoyage): ${cost.anchors.join(" · ")}`
@@ -610,7 +693,7 @@ function CityCostChip({ city }: { city: VerifiedCity }) {
   return (
     <span className={`cost-chip ${cost.tier}`} tabIndex={0} title={title}>
       {cost.tier}
-      {cost.dailyUsd != null ? ` · ~$${cost.dailyUsd}/day` : ""}
+      {daily != null ? ` · ~${fmtMoney(daily, dailyCode)}/day` : ""}
     </span>
   );
 }

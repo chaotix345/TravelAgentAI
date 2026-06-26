@@ -362,8 +362,27 @@ worth showing.
     adversarial review (a precipitation-availability guard so a dropped rain field can't mislabel a
     rainforest "very dry"; a NaN month-index guard; prompt-trigger tuning so it grounds timing
     without becoming mandatory on seasonless trips; a "best available" legend entry).
-12. Then the rest of the all-in-one vision: optional live flight search (Duffel sandbox, keyed) and
-    eventually booking — each a new tool on the same agent.
+12. ✅ **Flight search (deals, part 3) — DONE.** Added `find_flights` (`lib/flights.ts`), the SIXTH
+    grounding tool and the FIRST that needs an API key (Duffel). It resolves cities→IATA via Duffel's
+    Places endpoint, then one round-trip offer request (raw `fetch`, no SDK), and returns the cheapest
+    economy fare. The real lesson is **graceful degradation as a first-class value**: no
+    `DUFFEL_API_KEY` → the tool is never offered and the flights clause is dropped from the prompt, so
+    the app is byte-for-byte the keyless five-tool app; a typed `{source:'unavailable'}` result, never
+    a throw. Duffel TEST fares are synthetic (badged "test data"); a live key returns real fares
+    through the same code. Server-attached like every other grounded value.
+13. ✅ **Cross-currency display — DONE.** Budgets (always USD, World Bank) and Duffel fares (any
+    currency) are converted to the traveler's home
+    currency (`HOME_CURRENCY`, default AUD) at live **European Central Bank** reference rates, fetched
+    keyless from Frankfurter (`lib/currency.ts`). The teaching point: this is the FIRST grounding that
+    is **not a tool the model calls** — an exchange rate is a deterministic live fact, not a planning
+    decision, so it's a pure SERVER-SIDE transform run after `estimate_costs`/`find_flights` return,
+    not a model turn. The converted figures are fed back into the model's tool_result so its prose
+    cites the home-currency amount (no `$` next to `£`), and attached to the budget/fare blocks with an
+    ECB-rate provenance line. Graceful degradation: any FX failure or unsupported currency shows the
+    native figure only. Same native/home split, server-attached discipline, and free-authoritative-
+    source ethos (ECB, like World Bank and Open-Meteo) as the rest.
+14. Then the rest of the all-in-one vision: deeper deals and eventually booking — each a new tool on
+    the same agent.
 
 ## The Assignment
 

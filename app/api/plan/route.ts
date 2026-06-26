@@ -11,12 +11,13 @@ import {
   type VerifiedItinerary,
   type VerifyStatus,
 } from "@/lib/schema";
-import { SYSTEM_PROMPT, FLIGHTS_CLAUSE } from "@/lib/prompt";
+import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, currencyClause } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
 import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
 import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
+import { homeCurrency, getRate, applyFxToCost, applyFxToFlights, costModelView } from "@/lib/currency";
 
 // The Anthropic SDK needs the Node runtime (not edge).
 export const runtime = "nodejs";
@@ -353,7 +354,9 @@ function annotateItinerary(
     if (sc) matchedSeason.push(sc);
     return {
       ...city,
-      ...(cc ? { cost: { tier: cc.tier, dailyUsd: cc.dailyUsd, anchors: cc.anchors } } : {}),
+      ...(cc
+        ? { cost: { tier: cc.tier, dailyUsd: cc.dailyUsd, dailyHome: cc.dailyHome ?? null, anchors: cc.anchors } }
+        : {}),
       ...(sc && sc.source === "open-meteo" ? { season: sc } : {}),
       days: city.days.map((day) => ({
         label: day.label,
@@ -379,11 +382,22 @@ function annotateItinerary(
       totalUsd != null && totalNights > 0 && !hasUnpriced
         ? Math.round(totalUsd / totalNights)
         : null;
+    // Convert the recomputed headline figures with the SAME rate the FX pass used (carried on
+    // costEstimate), so the home total reflects the FINAL city set — not a stale pre-emit total —
+    // the same recompute-from-the-plan discipline the USD figures follow. Absent rate → native only.
+    const rate = costEstimate.rate;
+    const totalHome = rate != null && totalUsd != null ? Math.round(totalUsd * rate) : null;
+    const perDayHome = rate != null && perDayUsd != null ? Math.round(perDayUsd * rate) : null;
     budget = {
       style: costEstimate.style,
       currency: costEstimate.currency,
       totalUsd,
       perDayUsd,
+      homeCurrency: costEstimate.homeCurrency,
+      totalHome,
+      perDayHome,
+      rate,
+      rateDate: costEstimate.rateDate,
       note: costEstimate.note,
       flags: costEstimate.flags,
     };
@@ -498,7 +512,16 @@ export async function POST(req: Request) {
   // to attempt. Present a key (a free Duffel test token) and the capability simply appears.
   const duffelKey = process.env.DUFFEL_API_KEY;
   const flightsEnabled = !!duffelKey;
-  const systemPrompt = SYSTEM_PROMPT + (flightsEnabled ? FLIGHTS_CLAUSE : "");
+
+  // The traveler's home/display currency (a user setting, default AUD). It drives a pure server-
+  // side FX pass that converts the USD budget and the Duffel fare into this currency at a live ECB
+  // rate — no extra model turn, since an exchange rate is a fact, not a decision. The clause is only
+  // added when home isn't USD; when it is, there's nothing to convert and the prompt is unchanged.
+  const HOME = homeCurrency();
+  const systemPrompt =
+    SYSTEM_PROMPT +
+    (flightsEnabled ? FLIGHTS_CLAUSE : "") +
+    (HOME !== "USD" ? currencyClause(HOME) : "");
 
   const client = new Anthropic();
   const encoder = new TextEncoder();
@@ -880,11 +903,31 @@ export async function POST(req: Request) {
               (done, total, name) => send({ type: "status", phase: "pricing", done, total, name }),
               req.signal,
             );
-            costEstimate = estimate; // attached to the final plan as the grounded budget
+            // Server-side FX pass: convert the (USD) estimate into the traveler's home currency at a
+            // live ECB rate and rewrite the "$"-baked flags, then use the CONVERTED estimate for both
+            // the model's tool_result (a single-currency costModelView, so its prose cites home
+            // figures and never sees a stray USD number to echo) and the attached budget. A null rate
+            // or home===USD leaves it untouched — graceful degradation to native USD.
+            // Keep the stream alive across the (bounded) FX fetch, which fires after the per-city
+            // pricing progress has stopped.
+            send({ type: "status", phase: "pricing", done: cities.length, total: cities.length, name: "converting to " + HOME });
+            const costFx = await getRate("USD", HOME, req.signal);
+            costEstimate = applyFxToCost(estimate, HOME, costFx); // attached as the grounded budget
+            // If conversion was EXPECTED (home isn't USD) but didn't land, tell the model plainly so
+            // it cites USD rather than trusting the prompt's "you'll see <home>" promise (which the UI
+            // also falls back from). When home is USD there's nothing to convert — no note.
+            const costFxNote =
+              HOME !== "USD" && costEstimate.homeCurrency == null
+                ? ` NOTE: live conversion to ${HOME} was unavailable — the figures above are in USD; present them as US dollars.`
+                : "";
             messages.push({
               role: "user",
               content: [
-                { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(estimate) },
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(costModelView(costEstimate)) + costFxNote,
+                },
               ],
             });
             costedOnce = true;
@@ -992,17 +1035,36 @@ export async function POST(req: Request) {
             } finally {
               clearInterval(flightHeartbeat);
             }
+            // Same server-side FX pass as the budget: convert the Duffel fare (quoted in its own
+            // currency — a sandbox fare can come back as "A$126") into the home currency at a live
+            // ECB rate, so the FlightsBlock and the model's prose both speak the traveler's currency.
+            // No-op when Duffel already quoted in the home currency or the rate fetch fails. The
+            // status keeps the stream alive across the bounded FX fetch (the Duffel heartbeat is gone).
+            if (result.source === "duffel" && result.currency) {
+              send({ type: "status", phase: "flights", name: "converting to " + HOME });
+              const flightFx = await getRate(result.currency, HOME, req.signal);
+              result = applyFxToFlights(result, HOME, flightFx);
+            }
             // Attach only a real priced result to the plan (handled in annotateItinerary); an
             // "unavailable" result still goes back to the model so it won't claim a fare, but it
             // adds no flight block — the graceful-degradation path.
             flightEstimate = result;
+            // Conversion expected (fare is in a non-home currency) but didn't land → tell the model
+            // to cite the original currency rather than a home figure it never received.
+            const flightFxNote =
+              result.source === "duffel" &&
+              result.currency &&
+              result.currency !== HOME &&
+              result.homeAmount == null
+                ? ` NOTE: live conversion to ${HOME} was unavailable — the fare is in ${result.currency}; present it in ${result.currency}.`
+                : "";
             messages.push({
               role: "user",
               content: [
                 {
                   type: "tool_result",
                   tool_use_id: toolUse.id,
-                  content: JSON.stringify(flightModelView(result)),
+                  content: JSON.stringify(flightModelView(result)) + flightFxNote,
                 },
               ],
             });

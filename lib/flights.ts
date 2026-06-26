@@ -377,6 +377,10 @@ export async function findFlights(
 // A compact, model-facing view of the result for the tool_result — the model needs the gist (did
 // it work, what's the round-trip price, is it test data) to weave one honest line into its plan,
 // not the full structured payload. The full detail goes to the UI via the server attach.
+//
+// `price` leads with the HOME-currency fare (attached by the route's FX pass) so the model cites
+// the same figure the FlightsBlock shows — never the raw Duffel currency, which a test fare can
+// quote as a stray "AUD 126". The native fare rides along as `nativePrice` only when it differs.
 export function flightModelView(result: FlightResult): unknown {
   if (result.source === "unavailable") {
     return { available: false, reason: result.reason, note: result.note };
@@ -384,15 +388,18 @@ export function flightModelView(result: FlightResult): unknown {
   const route = result.legs
     .map((l) => `${l.fromCode}→${l.toCode} ${l.date}`)
     .join(", ");
+  const nativePrice =
+    result.totalAmount != null ? `${result.currency ?? ""} ${result.totalAmount}`.trim() : null;
+  const homePrice =
+    result.homeAmount != null ? `${result.homeCurrency ?? ""} ${result.homeAmount}`.trim() : null;
   return {
     available: true,
     testMode: result.testMode,
     origin: result.origin,
     route,
-    price:
-      result.totalAmount != null
-        ? `${result.currency ?? ""} ${result.totalAmount}`.trim()
-        : null,
+    // Home figure first (what the traveler sees); fall back to native when no conversion ran.
+    price: homePrice ?? nativePrice,
+    nativePrice: homePrice && nativePrice !== homePrice ? nativePrice : undefined,
     airline: result.airline,
     note: result.note,
   };

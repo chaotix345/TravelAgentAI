@@ -83,16 +83,30 @@ export type VerifiedDay = {
 export type CostTier = "cheap" | "moderate" | "pricey" | "expensive" | "unknown";
 export type CityCostSummary = {
   tier: CostTier;
-  dailyUsd: number | null; // per-person, per-day, all-in, for the chosen style
-  anchors: string[]; // verbatim real price examples from Wikivoyage
+  dailyUsd: number | null; // per-person, per-day, all-in, for the chosen style (native, USD)
+  dailyHome: number | null; // same figure converted to the traveler's home currency, or null
+  anchors: string[]; // verbatim real price examples from Wikivoyage (left in their local currency)
 };
+// Currency is now TWO-layered, the same way places carry a verdict and the budget a tier: the
+// NATIVE figure is what the grounding source speaks (World Bank price levels are USD-denominated,
+// so the budget is always native USD), and the HOME figure is that amount converted to the
+// traveler's currency (default AUD) at a live European Central Bank reference rate. The conversion
+// is a pure SERVER-SIDE transform (lib/currency.ts) — not a tool the model calls — because an
+// exchange rate is a deterministic live fact, not a planning decision. Both are kept so the UI can
+// show "≈ £1,840 ($2,420)" honestly; `*Home` is null when no conversion ran (home === native, or
+// the FX fetch failed → we degrade to native-only, like flights/season degrade to "no data").
 export type BudgetSummary = {
   style: "budget" | "mid-range" | "luxury";
-  currency: "USD";
-  totalUsd: number | null; // per person, lodging+food+local; excludes flights/intercity
+  currency: string; // the native currency the figures are computed in (always "USD" for the budget)
+  totalUsd: number | null; // per person, lodging+food+local; excludes flights/intercity (native)
   perDayUsd: number | null;
+  homeCurrency?: string; // ISO 4217 the figures were converted to (e.g. "GBP"); absent when no conversion
+  totalHome?: number | null; // totalUsd converted to homeCurrency
+  perDayHome?: number | null; // perDayUsd converted to homeCurrency
+  rate?: number; // the native→home rate actually used (e.g. 0.76 USD→GBP)
+  rateDate?: string; // the ECB publish date of that rate (YYYY-MM-DD)
   note: string;
-  flags: string[];
+  flags: string[]; // already rewritten into homeCurrency when a conversion ran
 };
 // Same Approach-B idea applied to TIMING: when the model calls best_time_to_go, the route grounds
 // each city's seasonality in real climate normals (Open-Meteo ERA5) and attaches the result here.
@@ -150,8 +164,15 @@ export type FlightSummary = {
   testMode: boolean; // true → synthetic test data → show the disclaimer
   origin: string; // the departure city as the traveler phrased it
   legs: FlightLeg[]; // [outbound] or [outbound, return]
-  totalAmount: number | null; // cheapest combined price, in `currency`
-  currency: string | null; // ISO 4217 from Duffel (e.g. "GBP", "USD")
+  totalAmount: number | null; // cheapest combined price, in `currency` (native, whatever Duffel quoted)
+  currency: string | null; // ISO 4217 from Duffel (e.g. "GBP", "USD", or "AUD" for a sandbox fare)
+  // Same native/home split as the budget: Duffel quotes in its own currency (a test fare can come
+  // back as "A$126"), so we convert to the traveler's home currency at the ECB rate. `homeAmount`
+  // is absent when no conversion ran (Duffel already quoted in the home currency, or FX failed).
+  homeCurrency?: string; // ISO 4217 the fare was converted to (e.g. "GBP")
+  homeAmount?: number | null; // totalAmount converted to homeCurrency
+  rate?: number; // the native→home rate used
+  rateDate?: string; // ECB publish date of that rate (YYYY-MM-DD)
   airline: string | null; // the cheapest offer's airline (e.g. "Duffel Airways" in test mode)
   cabin: string; // "economy" in v1
   note: string; // price basis + the test-mode disclaimer
