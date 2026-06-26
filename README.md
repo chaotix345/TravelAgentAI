@@ -7,11 +7,11 @@ things to do. No wall of options. It has an opinion.
 
 This is **v1.5+ (Approach B + C)** from `DESIGN.md`: a grounded, streaming agent. It may
 ask one or two quick questions first (only when they'd change the plan), then drafts a
-route, **grounds it in real data with three tools** — it verifies the named places against
-a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
-distances along the route, and grounds the **budget** in real cost data (World Bank price
-levels + Wikivoyage) — all in a single agent loop, streaming live progress and marking
-each activity confirmed-real in the UI.
+route and **grounds it in real data with four keyless tools** — it verifies the named places
+against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
+distances along the route, grounds the **budget** in real cost data (World Bank price levels +
+Wikivoyage), and grounds the **timing** in real climate normals (Open-Meteo) — all in a single
+agent loop, streaming live progress and marking each activity confirmed-real in the UI.
 
 After the plan lands you can **refine it in plain language** — *"swap Coimbra for Braga",
 "make day 2 lighter", "add a city"* — and get back one revised, fully re-grounded plan
@@ -38,13 +38,15 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
 
 - **`app/page.tsx`** — the UI: one textarea, an optional clarifying-questions card, a
   live progress indicator (drafting → verifying *N/M* → routing *N/M cities* → pricing *N/M
-  cities* → finalizing), and the rendered itinerary with a **✓ real** badge on each verified
-  place, a **grounded budget block** (trip total + per-day + where-to-save flags), and a
-  per-city **cost chip** (cheap/moderate/pricey/expensive · ~$/day, with real Wikivoyage
-  example prices on hover). It reads the plan route's streamed events with a `fetch` +
-  `ReadableStream` reader. Below a finished plan, a **refine composer** (quick chips + a
-  free-text box) sends a change back through the same stream and repaints the revised plan
-  in place.
+  cities* → timing *N/M cities* → finalizing), and the rendered itinerary with a **✓ real** badge
+  on each verified place, a **grounded budget block** (trip total + per-day + where-to-save
+  flags), a per-city **cost chip** (cheap/moderate/pricey/expensive · ~$/day, with real Wikivoyage
+  example prices on hover), and a **"When to go" block** with a per-city **12-month weather strip**
+  (each month coloured peak/shoulder/off-season, the trip's target month ringed, hover for that
+  month's detail) plus a target-month verdict. It reads the plan route's streamed events with a
+  `fetch` + `ReadableStream` reader. Below a finished plan, a **refine composer** (quick chips + a
+  free-text box) sends a change back through the same stream and repaints the revised plan in
+  place. A footer credits the keyless data sources (incl. Open-Meteo, CC BY 4.0).
 - **`app/api/clarify/route.ts`** — `POST /api/clarify` takes `{ brief }` and, on a fast
   cheap model (`claude-haiku-4-5`), decides whether to ask the traveler up to two quick
   questions (trip *depth*, *must-includes / hard no's*). Returns `{ questions: [...] }` —
@@ -52,22 +54,25 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
 - **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications?, refine? }`
   and runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
   *forced* to verify its named places first (`verify_places`); then it's offered the optional
-  grounding tools it hasn't spent yet — `check_route` (multi-city only) and `estimate_costs` —
-  alongside `emit`, picking one per turn until none remain; finally it is *forced* to emit the
-  itinerary. The verification verdict **and** the grounded budget are attached on the server
-  before it streams back. When `refine` is present it carries the latest plan plus a change;
-  the route strips its own annotations off that plan, seeds it (and the change) into the
-  conversation, and runs the **same loop** — so the revision is re-verified, re-routed if its
-  cities changed, and re-priced if its cities/nights changed. Every turn forces exactly one
-  tool (`disable_parallel_tool_use`), so a large plan can't split a tool into parallel calls
-  and orphan a tool result.
+  grounding tools it hasn't spent yet — `check_route` (multi-city only), `estimate_costs`, and
+  `best_time_to_go` — alongside `emit`, picking one per turn until none remain; finally it is
+  *forced* to emit the itinerary. The verification verdict, the grounded budget **and** the
+  grounded seasonality are attached on the server before it streams back. When `refine` is present
+  it carries the latest plan plus a change; the route strips its own annotations off that plan,
+  seeds it (and the change) into the conversation, and runs the **same loop** — so the revision is
+  re-verified, re-routed if its cities changed, and re-priced / re-timed if its cities or nights
+  changed. Every turn forces exactly one tool (`disable_parallel_tool_use`), so a large plan can't
+  split a tool into parallel calls and orphan a tool result; a small `coerceArray` helper also
+  recovers a tool-input array the model occasionally returns as a JSON *string*, so that quirk
+  can't sink a plan.
 - **`lib/verify.ts`** — executes the `verify_places` tool: checks each place against
   OpenStreetMap (Nominatim) with a Wikipedia fallback. Free, no API key, throttled to ~1
   request/second per OSM's usage policy. A **token-overlap guard** rejects loose matches
   (a free geo search returns *some* best hit for any string, so a made-up name can latch
   onto a real node — we require a real name-word in the match), and each lookup has a
   5s timeout. Reports per-place progress so the route can stream it. Also exports
-  `geocodeCity`, which turns a city name into a lat/lon centroid using the same layer.
+  `geocodeCity`, which turns a city name into a lat/lon centroid using the same layer —
+  reused by both `check_route` and `best_time_to_go`.
 - **`lib/route.ts`** — executes the `check_route` tool: geocodes each city centroid
   (`geocodeCity`) and computes **great-circle (haversine) distances** between consecutive
   cities. It flags long hops, and if a clearly tighter order exists (a 2-opt pass that beats
@@ -89,16 +94,31 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   ~200 countries: `priceLevel = consumer-PPP-factor / market-exchange-rate` (US = 1.0), from
   World Bank Open Data (CC BY 4.0). A static constant — no runtime call. Rerun the script to
   refresh the year.
+- **`lib/season.ts`** — executes the `best_time_to_go` tool, grounding the **timing**. It reuses
+  `geocodeCity` to turn each city into a lat/lon, then fetches **5 years of daily weather from the
+  keyless, free Open-Meteo ERA5 archive** (real *observed* climate, non-commercial use, CC BY 4.0)
+  and aggregates it server-side into 12 monthly normals. A tunable **comfort model** (a temperature
+  score on the mean daily *high*, minus a dryness penalty from rain days) labels each month
+  peak/shoulder/off-season and derives a "best months to go" window — handling the wrap-around
+  (a Nov–Feb peak) and the Mediterranean split (a brutal summer between a spring and an autumn
+  window). Two overrides keep it honest worldwide: a **tropical override** ranks by rain instead of
+  heat (so Bangkok's dry season Nov–Mar reads as peak, not "always too hot"), and a
+  **challenging-climate override** labels the least-bad months "best available" where no month is
+  genuinely comfortable (Reykjavik). Hemisphere needs no special-casing — labels come from the real
+  numbers, so Sydney is correctly warm in January. Keyless and throttled like the geo tools, with a
+  process-lifetime cache (normals barely change) and graceful degradation to "no data" on any
+  error. The thresholds are documented, tunable heuristics. It grounds **weather** only — there's
+  no keyless source for tourist crowds — and says so in a caveat.
 - **`lib/schema.ts`** — the itinerary shape, defined once as a Zod schema. It's the
   contract between the model and the UI. The same Zod schema is converted to JSON Schema
   (Zod 4's native `z.toJSONSchema`) and handed to Claude as the **forced** `emit_itinerary`
   tool — the reliable way to get structured JSON back. The response is validated with the
   same Zod schema before it reaches the UI. Enriched `Verified*` types add the per-activity
-  verdict, and self-contained `BudgetSummary` / `CityCostSummary` types carry the server-
-  attached, grounded budget (kept import-free so the client bundle never pulls in the cost
-  data or fetch logic).
+  verdict, and self-contained `BudgetSummary` / `CityCostSummary` / `SeasonSummary` /
+  `MonthSeason` types carry the server-attached, grounded budget and seasonality (kept
+  import-free so the client bundle never pulls in the cost data, climate fetch, or scoring logic).
 - **`lib/prompt.ts`** — two system prompts: the decisive-travel-agent personality for the
-  planner (now describing all three grounding tools and when to spend the optional ones), and
+  planner (now describing all four grounding tools and when to spend the optional ones), and
   a tight "ask only if it matters" prompt for the clarify step.
 
 ## The agent loop (the concept worth understanding)
@@ -109,15 +129,17 @@ the loop stays bounded while the agent becomes genuinely multi-tool.
 
 ```
 messages = [user brief, (optional: clarifying Q&A)]
-turn 1:  Claude -> tool_use: verify_places([...])    # FORCED — it can't skip grounding
+turn 1:  Claude -> tool_use: verify_places([...])     # FORCED — it can't skip grounding
          run OpenStreetMap/Wikipedia, push tool_result onto messages
 turn 2…: Claude is offered the optional tools it hasn't spent + emit, picks ONE:
-           check_route([cities])    # multi-city only — geocode + leg distances + flags
-           estimate_costs([cities]) # cost tier + daily budget + Wikivoyage price anchors
-           emit_itinerary({...})    # done
-         (it loops here at most twice — route + cost are each gated to one use)
-turn N:  Claude -> tool_use: emit_itinerary({...})   # FORCED once nothing optional remains
-         attach our verdicts + grounded budget -> render badges
+           check_route([cities])      # multi-city only — geocode + leg distances + flags
+           estimate_costs([cities])   # cost tier + daily budget + Wikivoyage price anchors
+           best_time_to_go([cities])  # 12-month climate normals -> peak/shoulder/off + best window
+           emit_itinerary({...})      # done
+         (route/cost/timing are each gated to one use; cost & timing wait until the route is
+          settled, so they see the final city set)
+turn N:  Claude -> tool_use: emit_itinerary({...})    # FORCED once nothing optional remains
+         attach our verdicts + grounded budget + grounded seasonality -> render badges
 ```
 
 Three things make this sturdy:
@@ -127,19 +149,20 @@ Three things make this sturdy:
   it never grounded — grounding is **structural**, not a polite request in the prompt.
 - **The optional tools are the agent's choice, gated to where they matter.** After
   verification, the model is offered the optional grounding tools it hasn't used yet —
-  `check_route` (multi-city only) and `estimate_costs` — alongside `emit`, and must pick
-  exactly one (`tool_choice: {type:"any", disable_parallel_tool_use:true}`). Each is gated to
-  a single use, so the loop can't spin: at most one route turn + one cost turn before emit. A
-  single-city trip is never offered `check_route`; a trip with no budget angle just won't be
-  steered to `estimate_costs`. This adds the new tools **without** weakening the place-grounding
-  guarantee: `verify_places` stays the lone forced tool on turn 1 regardless.
+  `check_route` (multi-city only), `estimate_costs`, and `best_time_to_go` — alongside `emit`,
+  and must pick exactly one (`tool_choice: {type:"any", disable_parallel_tool_use:true}`). Each is
+  gated to a single use, so the loop can't spin: at most one route + one cost + one timing turn
+  before emit. Cost and timing are only offered once the route is settled, so they compute against
+  the final city set. A single-city trip is never offered `check_route`; a trip with no budget or
+  timing angle just won't be steered to those tools. This adds the new tools **without** weakening
+  the place-grounding guarantee: `verify_places` stays the lone forced tool on turn 1 regardless.
 - **Streaming.** Each model call uses `client.messages.stream(...).finalMessage()` (no
   HTTP timeout on the large emit turn, room for `max_tokens` up to 64k on long trips), and
   the route streams phase + per-place + per-city progress events the whole way. A heartbeat
   keeps the connection visibly alive during the silent model turns.
 
-The loop is bounded (`MAX_TURNS = 6`, worst legitimate path verify-retry → verify → route →
-cost → emit) on purpose: every turn is a full, slow model call, and a free-form loop
+The loop is bounded (`MAX_TURNS = 7`, worst legitimate path verify-retry → verify → route →
+cost → timing → emit) on purpose: every turn is a full, slow model call, and a free-form loop
 ballooned to ~100s in testing.
 
 ## Grounding the route (why a second tool)
@@ -179,9 +202,31 @@ The agent uses the result to right-size nights to the budget, flag or swap an ex
 and point out where to save — then emits. Like the verify verdict, the **displayed budget is
 the tool's output, server-attached** in `annotateItinerary`, never a number the model
 asserted. Figures are per person and cover lodging, food, local transport and activities;
-they exclude flights and intercity transport (no free price source for those). Seasonality
-(Open-Meteo) and live flight search (Duffel sandbox) are clean next tools, deliberately
-deferred.
+they exclude flights and intercity transport (no free price source for those).
+
+## Grounding the timing (the second deals step)
+
+Knowing *when* to go is the other big free lever on a trip — shoulder season is cheaper and
+quieter, and a brutal month can ruin a good route. The model has rough intuitions about seasons
+but confidently gets the specifics wrong (which month is actually pleasant, how brutal a summer
+is, that a tropical city's "season" is wet-vs-dry not hot-vs-cold). So `best_time_to_go` grounds
+the timing the same way `verify_places` grounds places — in real, keyless data:
+
+- **5 years of Open-Meteo ERA5 climate normals** (free, no key, real *observed* weather), fetched
+  per city via the geocoder we already had and aggregated server-side into 12 monthly normals.
+- **A comfort model** scores each month from the mean daily high (a temperature curve with a
+  comfortable 20–26 °C band) minus a dryness penalty from rain days, then labels it
+  peak/shoulder/off-season and derives the best months to go. A **tropical override** switches to
+  ranking by rain where temperature is flat year-round; a **challenging-climate override** is
+  honest about places no month makes truly comfortable. Hemisphere falls out of the real numbers —
+  no "summer = July" assumption to get backwards.
+
+When the brief implies a month, the tool assesses it ("August: off-season in Seville — extreme
+heat, 37 °C") so the agent can warn the traveler and suggest a better window, or adapt the plan
+(early starts, shaded afternoons, rain backups). Like the budget, the **displayed seasonality is
+server-attached** (`annotateItinerary`, with the target-month verdict recomputed from the final
+cities), never the model's claim. It grounds **weather comfort only** — there's no keyless source
+for tourist crowds, so a caveat says a weather-mild month can still be the busiest.
 
 ## Clarifying questions (Approach C)
 
@@ -199,19 +244,20 @@ revised plan — decisive, never a menu. The client sends `POST /api/plan` with
 (prior tweaks already baked in, so there's no refine history to replay). The server:
 
 1. **Strips its own annotations** off the incoming plan by re-parsing it through the Zod
-   schema (`itinerarySchema.safeParse` drops the `verified`/`matched` keys), leaving a clean
-   `Itinerary` to embed. If the change is empty/oversized or the plan doesn't parse, it
-   ignores the refine and plans fresh.
+   schema (`itinerarySchema.safeParse` drops the `verified`/`matched`/`budget`/`season` keys),
+   leaving a clean `Itinerary` to embed. If the change is empty/oversized or the plan doesn't
+   parse, it ignores the refine and plans fresh.
 2. **Seeds the conversation** as `[user: brief] (+ clarify replay) + [assistant: the prior
-   plan] + [user: the change]`, then runs the **same** forced-verify → optional-check_route →
+   plan] + [user: the change]`, then runs the **same** forced-verify → optional grounding →
    forced-emit loop. No second loop, no new endpoint.
 
-Because the loop is reused unchanged, a refine is **re-grounded** (every place re-verified)
-and **re-routed** whenever the cities change — `multiCity` is re-detected from the revised
-plan. This is the next concept past the within-request agent loop: **conversation state
-carried across requests**, held client-side (like the clarifications) so it stays
-stateless-serverless friendly. Each refine re-verifies the whole plan, so it costs about as
-much as the first plan — correct, just heavier; fine for v1.
+Because the loop is reused unchanged, a refine is **re-grounded** (every place re-verified) and
+**re-routed / re-priced / re-timed** whenever the relevant part changes — `multiCity` is
+re-detected from the revised plan. This is the next concept past the within-request agent loop:
+**conversation state carried across requests**, held client-side (like the clarifications) so it
+stays stateless-serverless friendly. Each refine re-verifies the whole plan, so it costs about as
+much as the first plan — correct, just heavier; fine for v1 (and the season cache makes a
+same-cities re-timing near-free).
 
 ## Model and cost
 
@@ -242,8 +288,12 @@ small decision, not the planning).
   anchors — it does **not** fetch today's flight or hotel prices (no reliable free source
   exists). The daily figure is per person, covers lodging/food/local costs, and excludes
   flights and intercity transport. Cost tiers are country-level, so it won't distinguish a
-  pricey capital from a cheap town in the same country (the per-city Wikivoyage anchors hint
-  at that). Treat the total as a planning ballpark.
+  pricey capital from a cheap town in the same country. Treat the total as a planning ballpark.
+- **The season is weather, not crowds.** `best_time_to_go` grounds the *weather* per month from
+  real climate normals (temperature + rain). It has **no** data on tourist crowds, prices, school
+  holidays, or festivals — a month that's mild by weather can still be the busiest of the year. The
+  comfort labels are tunable heuristics for a general traveler, and the normals are a 5-year recent
+  average, not a guarantee for any one trip. Treat the labels as a strong steer, not a forecast.
 - **Long trips stream, but the function still has a wall-clock cap.** Streaming means the
   browser sees live progress instead of a blank spinner and never times out on its own.
   But the route still has to *finish* within the server's function cap — on Vercel's free
@@ -269,6 +319,10 @@ small decision, not the planning).
    attaches a real, server-grounded budget (World Bank price levels + Wikivoyage anchors) to
    the plan — the first piece of the deals step. Keyless and free, like the geo tools; grounds
    cost *level*, not live quotes (no reliable free price source exists).
-7. Then the rest of the all-in-one vision: seasonality/best-time-to-go (Open-Meteo, keyless),
-   optional live flight search (Duffel sandbox, keyed), and eventually booking — each a new
-   tool on the same agent.
+7. ✅ **Deals, part 2 — timing grounding — done.** A fourth grounding tool, `best_time_to_go`,
+   grounds *when* to go in real Open-Meteo climate normals (keyless, free) — peak/shoulder/off
+   season per month, a best-window recommendation, and a verdict on the traveler's chosen month.
+   Shoulder season is the biggest free lever on price and crowds, so it's the natural next deals
+   signal after budget.
+8. Then the rest of the all-in-one vision: optional live flight search (Duffel sandbox, keyed)
+   and eventually booking — each a new tool on the same agent.

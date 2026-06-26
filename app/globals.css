@@ -520,3 +520,156 @@ button.link:hover {
   opacity: 0.55;
   cursor: default;
 }
+
+/* --- Seasonality (best_time_to_go) --- */
+.season {
+  margin: 0 0 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.season-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.season-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.season-target {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
+.season-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 12px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.season-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.season-legend i.mo {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+}
+
+.season-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.city-season {
+  padding: 12px 18px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.months {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.mo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: var(--bg);
+  cursor: default;
+}
+
+.mo.peak {
+  color: #2f6f3e;
+  background: #dceede;
+  border-color: #bfe0c8;
+}
+
+.mo.shoulder {
+  color: #8a5a1c;
+  background: #f6ecd9;
+  border-color: #e6d2ad;
+}
+
+.mo.off {
+  color: #8a2a1c;
+  background: #fbe2dd;
+  border-color: #f0c2b9;
+}
+
+.mo.best-available {
+  color: #3a5f86;
+  background: #e3ecf6;
+  border-color: #c7d8ec;
+}
+
+.mo.target {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+.city-season-cap {
+  margin: 9px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.season-tag {
+  font-weight: 600;
+}
+
+.season-tag.peak {
+  color: #2f6f3e;
+}
+
+.season-tag.shoulder {
+  color: #8a5a1c;
+}
+
+.season-tag.off {
+  color: #8a2a1c;
+}
+
+.season-tag.best-available {
+  color: #3a5f86;
+}
+
+.sources {
+  margin-top: 48px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  text-align: center;
+}
+
+.sources a {
+  color: var(--accent);
+}

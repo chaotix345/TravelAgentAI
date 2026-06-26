@@ -339,9 +339,31 @@ worth showing.
     grounded budget block + per-city cost chips. Refines re-price when cities/nights change.
     This realises premise #2 (deals/booking plug into the same agent as tools) and updates the
     schema's once-deferred `approxCostNote` idea into a grounded, server-owned budget.
-11. Then the rest of the all-in-one vision: seasonality/best-time-to-go (Open-Meteo, keyless),
-    optional live flight search (Duffel sandbox, keyed), and eventually booking — each a new
-    tool on the same agent.
+11. ✅ **Seasonality / best-time-to-go (deals, part 2) — DONE.** Added a fifth grounding tool,
+    `best_time_to_go` (`lib/season.ts`), so the agent loop now grounds *places*, *route*, *budget*
+    AND *timing*. It reuses the free Nominatim geocoder (`geocodeCity`) to turn each city into a
+    lat/lon, then fetches 5 years of daily weather from the **keyless, free Open-Meteo ERA5
+    archive** (non-commercial use, CC BY 4.0 — the Historical Weather API is on the free tier; only
+    the CMIP6 Climate API is paid) and aggregates it server-side into 12 monthly normals. A tunable
+    comfort model (a temperature score on the mean daily high, minus a dryness penalty from rain
+    days) labels each month peak/shoulder/off-season and derives a "best months to go" window. Two
+    overrides keep it honest globally: a **tropical override** ranks by rain instead of heat (so
+    Bangkok's dry season Nov–Mar reads as peak, not "always too hot"), and a **challenging-climate
+    override** labels the least-bad months "best available" where no month is genuinely comfortable
+    (Reykjavik). Hemisphere needs no special-casing — labels come from the real numbers, so Sydney
+    is correctly warm in January. Wired in as the agent's *optional* choice (gated to one use,
+    offered after `check_route` so the budget/season see the final city set; `MAX_TURNS` raised
+    6→7); new `timing` stream phase; a per-city 12-month weather strip + a target-month verdict in
+    the UI. The season is **server-attached** (`annotateItinerary`, with the target-month verdict
+    recomputed from the FINAL cities), never the model's claim — same discipline as the verify
+    verdict and the budget. It grounds WEATHER comfort only (there is no keyless source for tourist
+    crowds) and says so in a caveat. This is the natural "deals" signal after budget: shoulder
+    season is the biggest free lever on both price and crowds. Hardened after a multi-agent
+    adversarial review (a precipitation-availability guard so a dropped rain field can't mislabel a
+    rainforest "very dry"; a NaN month-index guard; prompt-trigger tuning so it grounds timing
+    without becoming mandatory on seasonless trips; a "best available" legend entry).
+12. Then the rest of the all-in-one vision: optional live flight search (Duffel sandbox, keyed) and
+    eventually booking — each a new tool on the same agent.
 
 ## The Assignment
 

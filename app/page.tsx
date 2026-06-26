@@ -7,6 +7,9 @@ import type {
   VerifiedActivity,
   VerifiedCity,
   BudgetSummary,
+  SeasonSummary,
+  CitySeasonSummary,
+  SeasonLabel,
 } from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
 
@@ -25,7 +28,7 @@ const REFINE_CHIPS = ["Make it broader", "Make days lighter", "More food", "More
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -40,7 +43,7 @@ type Clarification = { prompt: string; answer: string };
 type Progress =
   | { phase: "drafting" | "finalizing" }
   | { phase: "verifying"; done: number; total: number }
-  | { phase: "routing" | "pricing"; done: number; total: number; name?: string };
+  | { phase: "routing" | "pricing" | "timing"; done: number; total: number; name?: string };
 
 // What runPlan needs: the brief + clarifications context, and — for a concierge tweak — the
 // latest plan plus the change to apply. A refine reuses the ORIGINAL brief/clarifications so
@@ -195,9 +198,13 @@ export default function Home() {
           if (evt.type === "status") {
             if (evt.phase === "verifying") {
               setProgress({ phase: "verifying", done: evt.done ?? 0, total: evt.total ?? 0 });
-            } else if (evt.phase === "routing" || evt.phase === "pricing") {
-              // Heartbeats during the route/cost turn carry no counts — don't let them blank an
-              // active bar; keep the last counts for this phase until a real tick lands.
+            } else if (
+              evt.phase === "routing" ||
+              evt.phase === "pricing" ||
+              evt.phase === "timing"
+            ) {
+              // Heartbeats during the route/cost/timing turn carry no counts — don't let them
+              // blank an active bar; keep the last counts for this phase until a real tick lands.
               const ph = evt.phase;
               setProgress((prev) =>
                 evt.total && evt.total > 0
@@ -328,6 +335,15 @@ export default function Home() {
           loading={loading}
         />
       )}
+
+      <footer className="sources">
+        Grounded with free, keyless data: place checks via OpenStreetMap &amp; Wikipedia, distances
+        via OpenStreetMap, cost levels via World Bank &amp; Wikivoyage, and climate via{" "}
+        <a href="https://open-meteo.com" target="_blank" rel="noreferrer noopener">
+          Open-Meteo
+        </a>{" "}
+        (CC BY 4.0). A planning aid, not a booking service.
+      </footer>
     </main>
   );
 }
@@ -407,12 +423,19 @@ function ProgressView({ progress }: { progress: Progress | null }) {
                   progress.name ? ` · ${progress.name}` : ""
                 }`
               : "Pricing the trip…"
-            : "Finalizing your itinerary…";
+            : progress.phase === "timing"
+              ? progress.total > 0
+                ? `Checking the best time to go… ${progress.done}/${progress.total} cities${
+                    progress.name ? ` · ${progress.name}` : ""
+                  }`
+                : "Checking the best time to go…"
+              : "Finalizing your itinerary…";
 
   const pct =
     (progress?.phase === "verifying" ||
       progress?.phase === "routing" ||
-      progress?.phase === "pricing") &&
+      progress?.phase === "pricing" ||
+      progress?.phase === "timing") &&
     progress.total > 0
       ? Math.round((progress.done / progress.total) * 100)
       : null;
@@ -441,6 +464,7 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
       </p>
 
       {itinerary.budget && <BudgetBlock budget={itinerary.budget} />}
+      {itinerary.season && <SeasonBlock season={itinerary.season} />}
 
       {itinerary.cities.map((city, i) => (
         <article className="city" key={`${city.name}-${i}`}>
@@ -452,6 +476,9 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
             </h2>
             {city.why && <p className="why">{city.why}</p>}
           </div>
+          {city.season && (
+            <CitySeason season={city.season} targetMonth={itinerary.season?.targetMonth ?? null} />
+          )}
           {city.days.map((day, j) => (
             <DayBlock key={`${city.name}-day-${j}`} day={day} />
           ))}
@@ -507,6 +534,108 @@ function CityCostChip({ city }: { city: VerifiedCity }) {
       {cost.tier}
       {cost.dailyUsd != null ? ` · ~$${cost.dailyUsd}/day` : ""}
     </span>
+  );
+}
+
+const MONTHS_FULL = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const MONTH_INITIALS = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
+const SEASON_WORD: Record<SeasonLabel, string> = {
+  peak: "peak season",
+  shoulder: "shoulder season",
+  off: "off-season",
+  "best-available": "the best available",
+};
+
+// The grounded seasonality, server-attached from the best_time_to_go tool. Trip-level block:
+// the target-month verdict (the decisive "is your month any good" line), a legend for the
+// per-city month strips below, and the honest weather-vs-crowds caveat. Like the budget, the
+// labels are the tool's, not the model's.
+function SeasonBlock({ season }: { season: SeasonSummary }) {
+  const targetName = season.targetMonth ? MONTHS_FULL[season.targetMonth - 1] : null;
+  return (
+    <div className="season">
+      <div className="season-head">
+        <span className="season-title">When to go</span>
+        <span
+          className="badge ok"
+          tabIndex={0}
+          title="Grounded in Open-Meteo climate normals (ERA5) — real observed weather, not crowds"
+        >
+          grounded
+        </span>
+      </div>
+      {season.targetAssessment && (
+        <p className="season-target">
+          {targetName ? <strong>{targetName}: </strong> : null}
+          {season.targetAssessment.replace(/^[A-Z][a-z]+:\s*/, "")}
+        </p>
+      )}
+      <div className="season-legend" aria-hidden="true">
+        <span>
+          <i className="mo peak" /> peak
+        </span>
+        <span>
+          <i className="mo shoulder" /> shoulder
+        </span>
+        <span>
+          <i className="mo off" /> off-season
+        </span>
+        {season.cities.some((c) => c.challenging) && (
+          <span>
+            <i className="mo best-available" /> best available
+          </span>
+        )}
+      </div>
+      <p className="season-note">
+        {season.note} {season.caveat}
+      </p>
+    </div>
+  );
+}
+
+// One city's 12-month weather strip: a cell per calendar month coloured by its season label,
+// the trip's target month ringed. Hover a cell for that month's detail. Below it, the headline
+// "best months" plus — when the trip has a target month — that month's verdict for this city.
+function CitySeason({
+  season,
+  targetMonth,
+}: {
+  season: CitySeasonSummary;
+  targetMonth: number | null;
+}) {
+  if (season.source !== "open-meteo" || season.months.length !== 12) return null;
+  const tm = targetMonth ? season.months[targetMonth - 1] : null;
+  return (
+    <div className="city-season">
+      <div className="months" role="img" aria-label={`Monthly weather for ${season.name}`}>
+        {season.months.map((m) => (
+          <span
+            key={m.month}
+            className={`mo ${m.label}${targetMonth === m.month ? " target" : ""}`}
+            tabIndex={0}
+            title={`${MONTHS_FULL[m.month - 1]}: ${m.temp}, ${m.meanMaxC}°C highs, ${m.rain}${
+              m.flags.length ? ` — ${m.flags.join("; ")}` : ""
+            } · ${SEASON_WORD[m.label] ?? m.label}`}
+          >
+            {MONTH_INITIALS[m.month - 1]}
+          </span>
+        ))}
+      </div>
+      <p className="city-season-cap">
+        {season.bestWindow}
+        {tm && (
+          <>
+            {" · "}
+            <span className={`season-tag ${tm.label}`}>
+              {MONTHS_FULL[tm.month - 1]}: {SEASON_WORD[tm.label] ?? tm.label}, {tm.meanMaxC}°C
+            </span>
+          </>
+        )}
+      </p>
+    </div>
   );
 }
 
