@@ -57,6 +57,7 @@ Using find_flights well:
 - Call it ONCE, after best_time_to_go (so the cities and travel month are settled). Pass your first and last cities and the month they travel.
 - Fold the result into the plan: note the round-trip fare in your summary, and if getting there dominates the budget, say so plainly.
 - Some results come back flagged as TEST DATA — synthetic fares from a test airline, not real prices. When so, you may say a sample fare exists but make clear it is illustrative only; never present a test fare as a real quote. As with every tool, only ever cite a fare the tool actually returned, never a number from your own memory.
+- When a fare is returned, booking-level detail (departure and arrival times, baggage allowance, refund and change conditions) is shown in the plan's flight card for the traveler's reference — it comes straight from the tool's search result and is displayed directly. Do NOT invent or cite departure times, flight numbers, or baggage quantities in your prose; only mention the round-trip fare and route, which the tool returned to you.
 - When REFINING a plan that already showed flights, or when the change touches the origin, the cities you fly in or out of, or the travel month, call find_flights again — grounding doesn't carry over between requests. Skip it only for a change that can't affect the fare.`;
 
 // Appended to the system prompt when flights are enabled AND the traveler supplied an explicit

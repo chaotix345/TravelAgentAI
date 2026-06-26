@@ -1238,6 +1238,35 @@ export async function POST(req: Request) {
               const flightFx = await getRate(result.currency, HOME, req.signal);
               result = applyFxToFlights(result, HOME, flightFx);
             }
+            // Penalty-condition FX pass. The refund/change penalties the enrich pass attached can be
+            // quoted in a DIFFERENT currency than the fare (some carriers price them in USD/EUR
+            // regardless), so the fare conversion above never touched them. Convert each distinct
+            // penalty currency that isn't already HOME; getRate caches per day, so when it matches
+            // the fare currency it's a cache hit. A failed fetch just leaves the home figure null and
+            // the UI shows the native penalty — the same graceful degradation as every money figure.
+            if (result.source === "duffel" && result.conditions) {
+              const updated = { ...result.conditions };
+              const penaltyCurrencies = new Set(
+                [updated.refundPenaltyCurrency, updated.changePenaltyCurrency].filter(
+                  (c): c is string => !!c && c !== HOME,
+                ),
+              );
+              if (penaltyCurrencies.size > 0) {
+                send({ type: "status", phase: "flights", name: "converting to " + HOME });
+                for (const cur of penaltyCurrencies) {
+                  const penaltyFx = await getRate(cur, HOME, req.signal);
+                  if (!penaltyFx) continue;
+                  updated.penaltyHomeCurrency = HOME;
+                  const conv = (amt: number | null) =>
+                    amt == null ? null : Math.round(amt * penaltyFx.rate);
+                  if (updated.refundPenaltyCurrency === cur)
+                    updated.refundPenaltyHome = conv(updated.refundPenaltyAmount);
+                  if (updated.changePenaltyCurrency === cur)
+                    updated.changePenaltyHome = conv(updated.changePenaltyAmount);
+                }
+                result = { ...result, conditions: updated };
+              }
+            }
             // Attach only a real priced result to the plan (handled in annotateItinerary); an
             // "unavailable" result still goes back to the model so it won't claim a fare, but it
             // adds no flight block — the graceful-degradation path.
