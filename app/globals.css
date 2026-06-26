@@ -367,6 +367,33 @@ button.link:hover {
   border: 1px solid #e6d2ad;
 }
 
+/* One-tap "find alternative" action shown beside an unconfirmed badge — a quiet inline link, not a
+   loud button, so it offers the fix without nagging on every plan. */
+.swap-btn {
+  margin-left: 8px;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  vertical-align: middle;
+}
+
+.swap-btn:hover {
+  color: var(--ink);
+}
+
+.swap-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  text-decoration: none;
+}
+
 .budget {
   margin: 0 0 28px;
   padding: 16px 18px;

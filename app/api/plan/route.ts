@@ -46,12 +46,21 @@ const MAX_BODY_CHARS = 1_000_000;
 // chooses to use adds one turn: estimate_costs, best_time_to_go and (when a Duffel key is set)
 // find_flights for a single-city trip, or check_route + those three for multi-city — each gated to
 // a single use. So the longest legitimate path is verify-retry -> verify -> check_route ->
-// estimate_costs -> best_time_to_go -> find_flights -> emit = 7 turns; 8 leaves a turn of
-// headroom. Each optional tool is gated to one use, so the loop can't spin. Guards against
-// anything unexpected so a request can't run forever.
+// estimate_costs -> best_time_to_go -> find_flights -> emit = 7 turns. The bounded repair round
+// (a second forced verify when round 1 finds places that don't exist) adds one to the longest path:
+// empty-verify -> verify -> repair-verify -> check_route -> estimate_costs -> best_time_to_go ->
+// find_flights -> emit = 8 turns; 9 leaves a turn of headroom. Each optional tool (and the repair
+// round) is gated to one use, so the loop can't spin. Guards against anything unexpected so a
+// request can't run forever.
 // When the traveler gives an explicit origin, emit is withheld until find_flights runs — but that
 // just FILLS the already-budgeted flights turn rather than adding one, so this bound is unchanged.
-const MAX_TURNS = 8;
+const MAX_TURNS = 9;
+// Genuine not-found places (absent from the free geo database — NOT a lookup that just errored)
+// that are a small slice of the plan trigger one repair round. But when they reach this fraction of
+// all submitted places, the draft is broadly broken (or the geo backend is flaking) and re-inventing
+// most of the plan would only churn — so we SKIP the repair and emit with honest "unconfirmed" badges
+// plus the per-activity "find alternative" affordance instead.
+const REPAIR_SUPPRESS_THRESHOLD = 0.6;
 // How many times the model may call verify_places with nothing checkable before
 // we give up with a clear error (instead of silently burning the turn budget).
 const EMPTY_VERIFY_RETRIES = 1;
@@ -93,7 +102,7 @@ function rateLimited(ip: string): boolean {
 const VERIFY_PLACES_TOOL: Anthropic.Tool = {
   name: "verify_places",
   description:
-    "Check whether named places (landmarks, neighbourhoods, markets, museums, restaurants) actually exist, using a free geographic database. Batch every place from your draft into a single call. Returns, for each, whether it was found. Use the results to drop or replace places that don't check out before finalizing.",
+    "Check whether named places (landmarks, neighbourhoods, markets, museums, restaurants) actually exist, using a free geographic database. Batch every place from your draft into a single call. Returns, for each, whether it was found. Use the results to drop or replace places that don't check out before finalizing. A result with checkFailed:true means the lookup itself errored (timeout or rate limit) — that is NOT evidence the place is fake, so treat it like a confirmed place, never a miss.",
   input_schema: {
     type: "object",
     properties: {
@@ -264,7 +273,15 @@ const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
+      phase:
+        | "drafting"
+        | "verifying"
+        | "regrounding"
+        | "routing"
+        | "pricing"
+        | "timing"
+        | "flights"
+        | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -501,7 +518,14 @@ export async function POST(req: Request) {
     // and fall back to planning fresh from the brief.
     if (body?.refine && typeof body.refine === "object") {
       const r = body.refine as Record<string, unknown>;
-      const instruction = typeof r.instruction === "string" ? r.instruction.trim() : "";
+      // Sanitize like the origin field: this instruction can be built client-side from a plan
+      // activity name (the "find alternative" swap), and a refine's prior plan is user-supplied, so
+      // strip control + Unicode-format chars (a newline could fake an instruction boundary in the
+      // user turn) and collapse whitespace before it rides into the user turn.
+      const instruction =
+        typeof r.instruction === "string"
+          ? r.instruction.replace(/[\x00-\x1f\x7f-\x9f\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim()
+          : "";
       const parsed = itinerarySchema.safeParse(r.itinerary);
       if (
         instruction.length > 0 &&
@@ -617,10 +641,15 @@ export async function POST(req: Request) {
         // turn is re-gated on the revised plan's distinct cities, a refine that changes
         // cities re-detects multiCity and re-checks the route automatically. The client
         // sends the LATEST plan (prior refines already baked in), so we don't replay history.
+        // The prior plan is user-supplied (client-sent) and seeded verbatim into a high-trust
+        // assistant turn, so strip Unicode-format chars (zero-width/bidi) from its serialized form —
+        // schema validation keeps string CONTENT, and these can fake structure in the model's context.
+        // Same trust-boundary discipline as the sanitized origin and refine instruction.
+        const priorPlanJson = JSON.stringify(refine.itinerary).replace(/\p{Cf}/gu, "");
         messages.push(
           {
             role: "assistant",
-            content: `Here's the itinerary I built:\n${JSON.stringify(refine.itinerary)}`,
+            content: `Here's the itinerary I built:\n${priorPlanJson}`,
           },
           { role: "user", content: refine.instruction },
         );
@@ -631,6 +660,14 @@ export async function POST(req: Request) {
       let costedOnce = false; // has the model used its one estimate_costs round?
       let seasonedOnce = false; // has the model used its one best_time_to_go round?
       let flightedOnce = false; // has the model used its one find_flights round?
+      // The bounded auto-repair round (parallel to flightedOnce): when round 1's verify turns up
+      // places that don't exist, the loop withholds emit and FORCES one more verify so the model can
+      // replace and re-check them. Capped at one round by repairedOnce — which the verify handler
+      // ALWAYS sets on the repair turn (like flightedOnce), so the withhold can't deadlock or spin.
+      let repairedOnce = false;
+      // Genuine not-found place names from round 1 (excludes lookup errors, and only when below the
+      // suppress threshold). A non-empty set is what arms the owesReverify repair branch.
+      const unconfirmedNames = new Set<string>();
       // The grounded budget from the last estimate_costs call, attached to the final plan.
       let costEstimate: CostEstimate | null = null;
       // The grounded seasonality from the last best_time_to_go call, attached to the final plan.
@@ -654,7 +691,14 @@ export async function POST(req: Request) {
           // a multi-city trip gets ONE optional check_route turn (the model chooses
           // route-or-emit), then emit is forced. Single-city trips skip straight to a
           // forced emit: there's no route to check.
-          let phase: "drafting" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
+          let phase:
+            | "drafting"
+            | "regrounding"
+            | "routing"
+            | "pricing"
+            | "timing"
+            | "flights"
+            | "finalizing";
           let toolsForTurn: Anthropic.Tool[];
           let toolChoice: Anthropic.ToolChoice;
           if (!verifiedOnce) {
@@ -665,6 +709,18 @@ export async function POST(req: Request) {
             // verify calls; the loop handles one tool_use per turn, so the extra calls would be
             // left without a tool_result and the API rejects the next turn. (Refines verify
             // more places, which is what surfaced this.)
+            toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
+          } else if (!repairedOnce && unconfirmedNames.size > 0) {
+            // Bounded auto-repair round. Round 1 turned up places that don't exist in the free geo
+            // database, so WITHHOLD emit and force one more verify_places call for the model's
+            // replacements. This is a DEDICATED branch, not an entry in the optional set below: that
+            // block force-emits the moment its list empties, which would let the model skip the
+            // repair entirely (the same structural-escape class the flights gate had to avoid). Capped
+            // at one round by repairedOnce (the handler always sets it), so it can't spin or deadlock,
+            // and it runs BEFORE route/cost/timing/flights so those ground the repaired plan. Same
+            // forced single-tool choice as the turn-1 verify.
+            phase = "regrounding";
+            toolsForTurn = [VERIFY_PLACES_TOOL];
             toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
           } else {
             // Places are grounded. Offer the OPTIONAL grounding tools the agent hasn't spent
@@ -825,7 +881,31 @@ export async function POST(req: Request) {
                 city: typeof p.city === "string" ? p.city : undefined,
               }));
 
+            // Round 1 is the forced turn-1 verify; the repair round is the second forced verify the
+            // owesReverify branch triggers. verify_places is only ever offered on those two turns, so
+            // this split is exhaustive.
+            const isRepairRound = verifiedOnce && !repairedOnce;
+
             if (places.length === 0) {
+              if (isRepairRound) {
+                // Empty repair batch = the model decided no replacements were needed. Consume the
+                // repair round (set repairedOnce so the withhold resolves — the same always-set
+                // discipline find_flights uses) and emit. Never touch emptyVerifyCount: that single
+                // retry belongs to round 1, not here.
+                repairedOnce = true;
+                messages.push({
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: toolUse.id,
+                      content:
+                        "No replacement places submitted — verification complete. Continue with the plan as usual.",
+                    },
+                  ],
+                });
+                continue;
+              }
               // The model called verify with nothing checkable. Don't count this as the
               // verification round (leave verifiedOnce false). Give it one retry via the
               // forced tool_choice; if it whiffs again, fail clearly rather than silently
@@ -852,14 +932,71 @@ export async function POST(req: Request) {
               continue;
             }
 
-            send({ type: "status", phase: "verifying", done: 0, total: places.length });
+            // Repair-round progress paints under its own "regrounding" phase so the bar doesn't
+            // reset and read as a stutter when a second pass runs after round 1 already hit 100%.
+            const verifyPhase = isRepairRound ? "regrounding" : "verifying";
+            send({ type: "status", phase: verifyPhase, done: 0, total: places.length });
             const results = await verifyPlaces(places, verifyCache, (done, total, last) =>
-              send({ type: "progress", done, total, name: last.name, found: last.found }),
+              isRepairRound
+                ? send({ type: "status", phase: "regrounding", done, total, name: last.name })
+                : send({ type: "progress", done, total, name: last.name, found: last.found }),
             );
+
+            if (isRepairRound) {
+              // The one repair round has run. Set repairedOnce UNCONDITIONALLY (like flightedOnce):
+              // some genuinely real places are simply absent from OSM/Wikipedia, so forcing more
+              // repair would spin and fight decisiveness. annotateItinerary reads the whole cache, so
+              // the replacements (now verified) get a real badge instead of the old no-badge silence.
+              repairedOnce = true;
+              // A replacement could (rarely) introduce a new city; fold it into multiCity so a trip
+              // that just became multi-city still gets its check_route turn. The swap prompt pins
+              // replacements to the same city, so this is a structural backstop, not the common path.
+              const repairCities = new Set(
+                places.map((p) => (p.city ?? "").trim().toLowerCase()).filter(Boolean),
+              );
+              multiCity = multiCity || repairCities.size >= 2;
+              messages.push({
+                role: "user",
+                content: [
+                  { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(results) },
+                ],
+              });
+              continue;
+            }
+
+            // Round 1. Arm a repair round only for GENUINE misses (a checkFailed result is a lookup
+            // error, not evidence the place is fake) AND only when they are a small enough slice of
+            // the plan to be worth replacing — a mostly-missing batch means a broken draft or a geo
+            // outage, where re-inventing everything just churns; we emit with honest badges instead.
+            const genuineMisses = results.filter((r) => !r.found && !r.checkFailed);
+            const checkFailedNames = results.filter((r) => r.checkFailed).map((r) => r.name);
+            if (
+              genuineMisses.length > 0 &&
+              genuineMisses.length / results.length < REPAIR_SUPPRESS_THRESHOLD
+            ) {
+              for (const m of genuineMisses) unconfirmedNames.add(m.name);
+            }
+            // Feed back the raw results plus, when a repair round is armed, an explicit list of what
+            // failed and how to act. This matches system-prompt step 3 (the repair round is FOR
+            // replacements, not mandatory): keep a place you're sure is real, replace the ones you
+            // doubt — fresh plans and refines use the same wording, so the loop and prompt agree.
+            // Place names come from the model's tool input (shaped by the user's brief), so strip
+            // control + format chars and quote each — symmetry with the refine.instruction
+            // sanitization, and quoting stops a comma inside a name from reading as a list separator.
+            const cleanName = (s: string) =>
+              s.replace(/[\x00-\x1f\x7f-\x9f\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+            const quoteNames = (names: string[]) => names.map((n) => `"${cleanName(n)}"`).join(", ");
+            let verifyResultContent = JSON.stringify(results);
+            if (unconfirmedNames.size > 0) {
+              verifyResultContent += ` These places were not found in the geo database: ${quoteNames([...unconfirmedNames])}. You get ONE more verify_places call. If you are confident a place is real (famous or well-known, just absent from the free database), keep it; otherwise replace it with a confident real alternative — then call verify_places again with your replacement names (confirmed places stay as they are).`;
+              if (checkFailedNames.length > 0) {
+                verifyResultContent += ` (${quoteNames(checkFailedNames)} had a temporary lookup error — not evidence they are fake, so you may keep them.)`;
+              }
+            }
             messages.push({
               role: "user",
               content: [
-                { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(results) },
+                { type: "tool_result", tool_use_id: toolUse.id, content: verifyResultContent },
               ],
             });
             verifiedOnce = true;
