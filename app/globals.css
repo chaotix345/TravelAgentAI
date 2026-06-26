@@ -80,6 +80,18 @@ textarea:focus {
   color: var(--ink);
 }
 
+/* The "Flying from?" origin field — shown only when flight pricing is configured. Reuses the
+   .q-label/.q-input language from the clarify form so it reads as a peer input to the brief. */
+.origin {
+  margin: 16px 0 4px;
+}
+
+.origin-hint {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .row {
   display: flex;
   align-items: center;

@@ -59,6 +59,17 @@ Using find_flights well:
 - Some results come back flagged as TEST DATA — synthetic fares from a test airline, not real prices. When so, you may say a sample fare exists but make clear it is illustrative only; never present a test fare as a real quote. As with every tool, only ever cite a fare the tool actually returned, never a number from your own memory.
 - When REFINING a plan that already showed flights, or when the change touches the origin, the cities you fly in or out of, or the travel month, call find_flights again — grounding doesn't carry over between requests. Skip it only for a change that can't affect the fare.`;
 
+// Appended to the system prompt when flights are enabled AND the traveler supplied an explicit
+// departure city via the dedicated "Flying from?" field. The VALUE itself rides in the user turn
+// (appended to the brief as a "Flying from:" line) — never here — because the system prompt is the
+// highest-trust position in the call and shouldn't carry raw user text. This clause is therefore
+// generic, server-controlled instruction: it tells the model HOW to use that origin. The loop ALSO
+// structurally requires find_flights for such a trip (it withholds emit until flights are priced),
+// so this is mainly for sequencing and prose — but stating it keeps the emitted plan coherent.
+export const ORIGIN_CLAUSE = `
+
+The traveler has named an explicit departure city — it appears in their brief as a "Flying from:" line. They told you where they fly from precisely so you would price their flights, so treat that city as the origin for find_flights and include the round-trip airfare in this plan. Settle the route and the travel month first (call best_time_to_go to ground the month, even if the dates are flexible or you think the destination is seasonless), then call find_flights with that origin together with the first city they fly into and the last city they fly home from. Cite the round-trip fare in your summary.`;
+
 // Appended to the system prompt when the traveler's home currency isn't USD, so the model cites
 // the converted figures the tool results now carry rather than the raw USD/Duffel numbers. Cost and
 // fare grounding is unchanged; this only steers which currency the model SAYS in its prose, so it

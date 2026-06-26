@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   VerifiedItinerary,
   VerifiedDay,
@@ -53,6 +53,7 @@ type Progress =
 type RunPlanOpts = {
   brief: string;
   clarifications: Clarification[];
+  origin?: string;
   refine?: { itinerary: VerifiedItinerary; instruction: string };
 };
 
@@ -71,6 +72,38 @@ export default function Home() {
   const [lastClarifications, setLastClarifications] = useState<Clarification[]>([]);
   const [refineLog, setRefineLog] = useState<string[]>([]);
   const [refineText, setRefineText] = useState("");
+  // The explicit departure city (the "Flying from?" field) and whether this deployment can even
+  // price flights. capabilities starts at the safe keyless default so the origin input is simply
+  // absent until /api/capabilities confirms a Duffel key — no layout flash, and the keyless app
+  // renders byte-for-byte as before. lastOrigin snapshots the origin that produced the current plan
+  // so refines stay anchored to it (mirrors lastBrief/lastClarifications).
+  const [origin, setOrigin] = useState("");
+  const [lastOrigin, setLastOrigin] = useState("");
+  const [capabilities, setCapabilities] = useState<{ flights: boolean; homeCurrency: string }>({
+    flights: false,
+    homeCurrency: "AUD",
+  });
+
+  // Discover capabilities once on mount. Best-effort, exactly like /api/clarify: any failure keeps
+  // the safe keyless default, so a hiccup just hides the flights affordance rather than erroring.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/capabilities")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d) return;
+        setCapabilities({
+          flights: !!d.flights,
+          homeCurrency: typeof d.homeCurrency === "string" ? d.homeCurrency : "AUD",
+        });
+      })
+      .catch(() => {
+        /* best-effort — keep the keyless default */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Step 1: ask the intake step whether it wants to clarify anything. If it does, show the
   // questions and wait; if not (or it errors), go straight to planning.
@@ -100,7 +133,7 @@ export default function Home() {
     } catch {
       // Clarify is best-effort — fall through to planning.
     }
-    await runPlan({ brief, clarifications: [] });
+    await runPlan({ brief, clarifications: [], origin });
   }
 
   function onAnswersSubmit() {
@@ -111,7 +144,7 @@ export default function Home() {
       .filter((c) => c.answer.length > 0);
     setQuestions(null);
     setLoading(true);
-    void runPlan({ brief, clarifications });
+    void runPlan({ brief, clarifications, origin });
   }
 
   // Concierge step: apply a change to the current plan. Sends the LATEST itinerary (prior
@@ -126,6 +159,7 @@ export default function Home() {
     void runPlan({
       brief: lastBrief,
       clarifications: lastClarifications,
+      origin: lastOrigin,
       refine: { itinerary, instruction: text },
     });
   }
@@ -155,6 +189,7 @@ export default function Home() {
         body: JSON.stringify({
           brief: opts.brief,
           clarifications: opts.clarifications,
+          origin: opts.origin,
           refine: opts.refine,
         }),
         signal: controller.signal,
@@ -235,6 +270,7 @@ export default function Home() {
             // it. For a refine, record the tweak in the running log.
             setLastBrief(opts.brief);
             setLastClarifications(opts.clarifications);
+            setLastOrigin(opts.origin ?? "");
             if (opts.refine) {
               const applied = opts.refine.instruction;
               setRefineLog((log) => [...log, applied]);
@@ -297,6 +333,29 @@ export default function Home() {
         ))}
       </div>
 
+      {capabilities.flights && (
+        <div className="origin">
+          <label htmlFor="origin" className="q-label">
+            Flying from?
+          </label>
+          <input
+            id="origin"
+            type="text"
+            className="q-input"
+            value={origin}
+            maxLength={120}
+            disabled={loading}
+            aria-describedby="origin-hint"
+            placeholder="e.g. Sydney, London, New York — to price your flights"
+            onChange={(e) => setOrigin(e.target.value)}
+          />
+          <p id="origin-hint" className="origin-hint">
+            Optional. Add your departure city and I&apos;ll price round-trip flights
+            {capabilities.homeCurrency !== "USD" ? ` in ${capabilities.homeCurrency}` : ""}.
+          </p>
+        </div>
+      )}
+
       {!questions && (
         <div className="row">
           <button
@@ -322,7 +381,7 @@ export default function Home() {
             if (loading) return;
             setQuestions(null);
             setLoading(true);
-            void runPlan({ brief, clarifications: [] });
+            void runPlan({ brief, clarifications: [], origin });
           }}
         />
       )}

@@ -71,14 +71,22 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   cheap model (`claude-haiku-4-5`), decides whether to ask the traveler up to two quick
   questions (trip *depth*, *must-includes / hard no's*). Returns `{ questions: [...] }` —
   empty when the brief already settles things, so the common case plans instantly.
-- **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications?, refine? }`
+- **`app/api/capabilities/route.ts`** — `GET /api/capabilities` returns `{ flights, homeCurrency }`
+  so the client knows whether a Duffel key is configured (and which currency to name) **before** the
+  user types — that's what gates the optional **"Flying from?"** origin input. It exposes only a
+  boolean that a key exists (never the key) plus the home currency, both already inferable from a
+  plan's output, so a keyless deploy stays byte-for-byte unchanged (the input simply never renders).
+- **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications?, origin?, refine? }`
   and runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
   *forced* to verify its named places first (`verify_places`); then it's offered the optional
   grounding tools it hasn't spent yet — `check_route` (multi-city only), `estimate_costs`,
   `best_time_to_go`, and (only when a Duffel key is set) `find_flights` — alongside `emit`, picking
   one per turn until none remain; finally it is *forced* to emit the itinerary. The verification
   verdict, the grounded budget, the grounded seasonality **and** the grounded flights are attached
-  on the server before it streams back. When `refine` is present
+  on the server before it streams back. A sanitized `origin` (from the **"Flying from?"** field) is
+  appended to the brief as a user-turn line and makes flight pricing a **required** step — the loop
+  withholds `emit` until `find_flights` has run — so naming where you fly from reliably lights up the
+  fare instead of leaving it to the model to infer from the brief. When `refine` is present
   it carries the latest plan plus a change; the route strips its own annotations off that plan,
   seeds it (and the change) into the conversation, and runs the **same loop** — so the revision is
   re-verified, re-routed if its cities changed, and re-priced / re-timed if its cities or nights
