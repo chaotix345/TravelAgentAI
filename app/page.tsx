@@ -29,7 +29,15 @@ const REFINE_CHIPS = ["Make it broader", "Make days lighter", "More food", "More
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
+      phase:
+        | "drafting"
+        | "verifying"
+        | "regrounding"
+        | "routing"
+        | "pricing"
+        | "timing"
+        | "flights"
+        | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -44,7 +52,12 @@ type Clarification = { prompt: string; answer: string };
 type Progress =
   | { phase: "drafting" | "finalizing" }
   | { phase: "verifying"; done: number; total: number }
-  | { phase: "routing" | "pricing" | "timing"; done: number; total: number; name?: string }
+  | {
+      phase: "routing" | "pricing" | "timing" | "regrounding";
+      done: number;
+      total: number;
+      name?: string;
+    }
   | { phase: "flights"; name?: string };
 
 // What runPlan needs: the brief + clarifications context, and — for a concierge tweak — the
@@ -238,9 +251,10 @@ export default function Home() {
             } else if (
               evt.phase === "routing" ||
               evt.phase === "pricing" ||
-              evt.phase === "timing"
+              evt.phase === "timing" ||
+              evt.phase === "regrounding"
             ) {
-              // Heartbeats during the route/cost/timing turn carry no counts — don't let them
+              // Heartbeats during the route/cost/timing/repair turn carry no counts — don't let them
               // blank an active bar; keep the last counts for this phase until a real tick lands.
               const ph = evt.phase;
               setProgress((prev) =>
@@ -393,7 +407,7 @@ export default function Home() {
       )}
       {loading && <ProgressView progress={progress} />}
 
-      {itinerary && <Plan itinerary={itinerary} />}
+      {itinerary && <Plan itinerary={itinerary} onRefine={onRefine} loading={loading} />}
 
       {itinerary && (
         <RefineComposer
@@ -490,33 +504,38 @@ function ProgressView({ progress }: { progress: Progress | null }) {
       ? "Building your route…"
       : progress.phase === "verifying"
         ? `Checking each place is real… ${progress.done}/${progress.total}`
-        : progress.phase === "routing"
+        : progress.phase === "regrounding"
           ? progress.total > 0
-            ? `Sanity-checking the route… ${progress.done}/${progress.total} cities${
-                progress.name ? ` · ${progress.name}` : ""
-              }`
-            : "Sanity-checking the route…"
-          : progress.phase === "pricing"
+            ? `Checking replacements… ${progress.done}/${progress.total}`
+            : "Checking replacements…"
+          : progress.phase === "routing"
             ? progress.total > 0
-              ? `Pricing the trip… ${progress.done}/${progress.total} cities${
+              ? `Sanity-checking the route… ${progress.done}/${progress.total} cities${
                   progress.name ? ` · ${progress.name}` : ""
                 }`
-              : "Pricing the trip…"
-            : progress.phase === "timing"
+              : "Sanity-checking the route…"
+            : progress.phase === "pricing"
               ? progress.total > 0
-                ? `Checking the best time to go… ${progress.done}/${progress.total} cities${
+                ? `Pricing the trip… ${progress.done}/${progress.total} cities${
                     progress.name ? ` · ${progress.name}` : ""
                   }`
-                : "Checking the best time to go…"
-              : progress.phase === "flights"
-                ? `Pricing flights…${progress.name ? ` · ${progress.name}` : ""}`
-                : "Finalizing your itinerary…";
+                : "Pricing the trip…"
+              : progress.phase === "timing"
+                ? progress.total > 0
+                  ? `Checking the best time to go… ${progress.done}/${progress.total} cities${
+                      progress.name ? ` · ${progress.name}` : ""
+                    }`
+                  : "Checking the best time to go…"
+                : progress.phase === "flights"
+                  ? `Pricing flights…${progress.name ? ` · ${progress.name}` : ""}`
+                  : "Finalizing your itinerary…";
 
   const pct =
     (progress?.phase === "verifying" ||
       progress?.phase === "routing" ||
       progress?.phase === "pricing" ||
-      progress?.phase === "timing") &&
+      progress?.phase === "timing" ||
+      progress?.phase === "regrounding") &&
     progress.total > 0
       ? Math.round((progress.done / progress.total) * 100)
       : null;
@@ -536,7 +555,15 @@ function ProgressView({ progress }: { progress: Progress | null }) {
   );
 }
 
-function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
+function Plan({
+  itinerary,
+  onRefine,
+  loading,
+}: {
+  itinerary: VerifiedItinerary;
+  onRefine: (instruction: string) => void;
+  loading: boolean;
+}) {
   return (
     <section className="plan">
       <p className="summary">{itinerary.summary}</p>
@@ -562,7 +589,13 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
             <CitySeason season={city.season} targetMonth={itinerary.season?.targetMonth ?? null} />
           )}
           {city.days.map((day, j) => (
-            <DayBlock key={`${city.name}-day-${j}`} day={day} />
+            <DayBlock
+              key={`${city.name}-day-${j}`}
+              day={day}
+              cityName={city.name}
+              onRefine={onRefine}
+              loading={loading}
+            />
           ))}
         </article>
       ))}
@@ -859,18 +892,62 @@ function CitySeason({
   );
 }
 
-function DayBlock({ day }: { day: VerifiedDay }) {
+function DayBlock({
+  day,
+  cityName,
+  onRefine,
+  loading,
+}: {
+  day: VerifiedDay;
+  cityName: string;
+  onRefine: (instruction: string) => void;
+  loading: boolean;
+}) {
+  const slotProps = { cityName, dayLabel: day.label, onRefine, loading };
   return (
     <div className="day">
       <h3>{day.label}</h3>
-      <Slot when="Morning" act={day.morning} />
-      <Slot when="Afternoon" act={day.afternoon} />
-      <Slot when="Evening" act={day.evening} />
+      <Slot when="Morning" act={day.morning} {...slotProps} />
+      <Slot when="Afternoon" act={day.afternoon} {...slotProps} />
+      <Slot when="Evening" act={day.evening} {...slotProps} />
     </div>
   );
 }
 
-function Slot({ when, act }: { when: string; act: VerifiedActivity }) {
+function Slot({
+  when,
+  act,
+  cityName,
+  dayLabel,
+  onRefine,
+  loading,
+}: {
+  when: string;
+  act: VerifiedActivity;
+  cityName: string;
+  dayLabel: string;
+  onRefine: (instruction: string) => void;
+  loading: boolean;
+}) {
+  // One-tap repair for a place the free geo database couldn't confirm. We build a tightly-scoped
+  // refine instruction keyed on city + day + time-of-day + name, so the planner swaps exactly this
+  // activity and nothing else, then re-grounds the whole plan through the same loop. The activity
+  // name is sanitized (control + Unicode-format chars stripped) before it goes into the string —
+  // defense in depth; the server sanitizes the instruction again at the trust boundary.
+  const swap = () => {
+    const slot = when.toLowerCase();
+    // Strip control/format chars, and neutralize double-quotes in the city/day labels since they sit
+    // inside quotes in the instruction (a stray quote would break the scoping). The server sanitizes
+    // the whole instruction again at the trust boundary — this is defense in depth.
+    const clean = (s: string) =>
+      s.replace(/[\x00-\x1f\x7f-\x9f\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim();
+    const safeName = clean(act.name).replace(/"/g, "'");
+    const safeCity = clean(cityName).replace(/"/g, "'");
+    const safeDay = clean(dayLabel).replace(/"/g, "'");
+    onRefine(
+      `In ${safeCity}, on "${safeDay}", swap only the ${slot} activity — "${safeName}" couldn't be verified in the geo database. Replace it with a different real place in ${safeCity} that fits the ${slot} and the trip's mood, and keep every other activity, city, and day exactly as they are.`,
+    );
+  };
   return (
     <div className="slot">
       <div className="when">{when}</div>
@@ -885,12 +962,24 @@ function Slot({ when, act }: { when: string; act: VerifiedActivity }) {
           </span>
         )}
         {act.verified === "unconfirmed" && (
-          <span
-            className="badge warn"
-            title="Couldn't confirm this one in the free geo database — treat with caution"
-          >
-            unconfirmed
-          </span>
+          <>
+            <span
+              className="badge warn"
+              title="Not in our free geo database — may still be real, just not listed there"
+            >
+              unconfirmed
+            </span>
+            <button
+              type="button"
+              className="swap-btn"
+              onClick={swap}
+              disabled={loading}
+              aria-label={`Find alternative for ${act.name}`}
+              title="Have the planner replace this with a place it can verify, and re-check the plan"
+            >
+              find alternative
+            </button>
+          </>
         )}
         {act.why && <div className="act-why">{act.why}</div>}
       </div>

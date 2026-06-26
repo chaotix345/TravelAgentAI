@@ -4,6 +4,13 @@ export type VerifyResult = {
   found: boolean;
   matched?: string;
   source?: "osm" | "wikipedia";
+  // True when the lookup itself ERRORED (timeout, 429, 5xx) rather than cleanly returning
+  // "no such place". A check failure is NOT evidence the place is fake — it just means we
+  // couldn't check this time — so callers must treat it differently from a genuine miss:
+  // never instruct the model to "replace" a checkFailed place, and don't let a batch of them
+  // (a Nominatim outage) trigger a repair round that re-invents real places. Absent on a
+  // clean found/not-found result.
+  checkFailed?: boolean;
 };
 
 type VerifyInput = { name: string; city?: string };
@@ -138,7 +145,7 @@ export async function verifyPlaces(
       // A network/timeout/HTTP error is not evidence the place is fake. Mark it
       // unconfirmed for this response, but DON'T cache it — a transient outage shouldn't
       // poison a later repeat of the same place, and a fresh run should get to retry.
-      const failed: VerifyResult = { name: place.name, city: place.city, found: false };
+      const failed: VerifyResult = { name: place.name, city: place.city, found: false, checkFailed: true };
       out.push(failed);
       report(failed);
     }
