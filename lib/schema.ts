@@ -159,6 +159,45 @@ export type FlightLeg = {
   date: string; // YYYY-MM-DD representative departure date for this leg
   stops: number | null; // 0 = nonstop; null if Duffel didn't break out segments
 };
+// Booking-ready detail, fetched by the "server-enrich pass" — a second, server-to-server GET
+// /air/offers/{id} (the richer single-offer endpoint Duffel flags as the "use when ready to book"
+// call). Shown only in the UI's "what you'd book" panel; never sent to the model (which can't cite
+// times or baggage it never received). Every field degrades to null when the rich response omits
+// it, so a partial payload still renders. Self-contained (no server-only import) for the client bundle.
+export type FlightSegmentDetail = {
+  departingAt: string | null; // ISO 8601 local departure time
+  arrivingAt: string | null; // ISO 8601 local arrival time
+  durationMinutes: number | null; // parsed from Duffel's ISO-8601 duration (e.g. "PT6H30M")
+  origin: string | null; // departure airport IATA code
+  originCity: string | null; // departure city name (null for some regional airports)
+  destination: string | null; // arrival airport IATA code
+  destinationCity: string | null; // arrival city name
+  flightDesignator: string | null; // marketing carrier + number, e.g. "BA234"
+  carrierName: string | null; // marketing carrier name
+};
+
+// Checked/carry-on allowance for one slice, taken as the MIN across its segments — if any leg
+// disallows a checked bag, the whole routing effectively does. null = Duffel didn't report it.
+export type SliceBaggage = {
+  checkedQuantity: number | null;
+  carryOnQuantity: number | null;
+};
+
+// Offer-level fare rules (refundability + change terms). The *Home fields are the penalty converted
+// to the traveler's home currency — the penalty currency can differ from the fare currency, so this
+// is a SEPARATE conversion from the fare's — and stay null when no conversion ran.
+export type FlightConditions = {
+  refundable: boolean | null; // null = Duffel didn't say
+  refundPenaltyAmount: number | null;
+  refundPenaltyCurrency: string | null;
+  refundPenaltyHome: number | null;
+  changeable: boolean | null;
+  changePenaltyAmount: number | null;
+  changePenaltyCurrency: string | null;
+  changePenaltyHome: number | null;
+  penaltyHomeCurrency: string | null; // ISO currency the *Home penalty figures are converted to
+};
+
 export type FlightSummary = {
   source: "duffel"; // only ever attached when a real Duffel search ran
   testMode: boolean; // true → synthetic test data → show the disclaimer
@@ -176,6 +215,17 @@ export type FlightSummary = {
   airline: string | null; // the cheapest offer's airline (e.g. "Duffel Airways" in test mode)
   cabin: string; // "economy" in v1
   note: string; // price basis + the test-mode disclaimer
+  // --- Booking-ready detail (the "server-enrich pass") ----------------------------------------
+  // All optional and additive: when the second GET /air/offers/{id} fails (timeout/429/404) the
+  // tool degrades to the lean summary and these stay absent, so the flights block still renders
+  // with price + route — additive-or-nothing, exactly like homeAmount. offerId is the scaffold a
+  // future hold/book step plugs into (not PII, not a payment instrument); expiresAt drives the
+  // honest "~30 min, re-search before booking" caveat. None of these reach the model.
+  offerId?: string; // Duffel offer ID for a future hold/order step; never rendered as text
+  expiresAt?: string | null; // ISO 8601 offer.expires_at; null when absent
+  sliceSegments?: FlightSegmentDetail[][] | null; // [outbound segments, return segments]
+  sliceBaggage?: SliceBaggage[] | null; // [outbound, return] baggage, parallel to sliceSegments
+  conditions?: FlightConditions | null; // offer-level refund/change terms
 };
 
 export type VerifiedCity = Omit<City, "days"> & {

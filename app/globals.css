@@ -548,6 +548,128 @@ button.link:hover {
   line-height: 1.45;
 }
 
+/* --- Booking-ready flight detail (the server-enrich pass) --- */
+.flights-stops {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.flights-expiry {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.flights-expiry.warn {
+  color: #8a2a1c;
+}
+
+.flights-detail-btn {
+  margin: 12px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.flights-detail-btn:hover {
+  text-decoration: underline;
+}
+
+.flights-detail {
+  margin: 12px 0 0;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--line);
+}
+
+.flights-detail-test {
+  margin: 0 0 12px;
+  color: #8a2a1c;
+  font-size: 0.8rem;
+}
+
+.flights-slice {
+  margin: 0 0 14px;
+}
+
+.flights-slice:last-of-type {
+  margin-bottom: 10px;
+}
+
+.flights-slice-label {
+  margin: 0 0 6px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.flights-segment {
+  margin: 0 0 8px;
+}
+
+.flights-segment:last-child {
+  margin-bottom: 0;
+}
+
+.flights-connection {
+  margin: 0 0 4px;
+  font-size: 0.78rem;
+  font-style: italic;
+  color: var(--muted);
+}
+
+.flights-seg-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 0.9rem;
+}
+
+.flights-seg-route {
+  font-weight: 600;
+}
+
+.flights-seg-times {
+  font-variant-numeric: tabular-nums;
+}
+
+.flights-seg-dur {
+  color: var(--muted);
+}
+
+.flights-seg-flight {
+  display: block;
+  margin: 2px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.flights-baggage {
+  margin: 6px 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.flights-conditions {
+  margin: 4px 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.flights-booking-caveat {
+  margin: 12px 0 0;
+  font-size: 0.78rem;
+  font-style: italic;
+  color: var(--muted);
+}
+
 .refine {
   margin-top: 32px;
   padding: 20px 18px 18px;

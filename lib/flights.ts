@@ -1,4 +1,10 @@
-import type { FlightLeg, FlightSummary } from "./schema";
+import type {
+  FlightConditions,
+  FlightLeg,
+  FlightSegmentDetail,
+  FlightSummary,
+  SliceBaggage,
+} from "./schema";
 
 // find_flights grounds the FLIGHTS of a plan — the one cost the budget tool deliberately leaves
 // out ("excludes flights and intercity transport — no reliable free price source"). It is the
@@ -22,6 +28,12 @@ import type { FlightLeg, FlightSummary } from "./schema";
 //      round-trip search. The body must be wrapped in { data: ... }; headers carry
 //      Authorization: Bearer, Duffel-Version: v2 (a literal string, NOT a date), Content-Type.
 //   3. GET /air/offers?offer_request_id=…&sort=total_amount&limit=1 → the cheapest offer.
+//   4. The "server-enrich pass": GET /air/offers/{id} for that cheapest offer — the RICHER
+//      single-offer endpoint Duffel flags as the "use when ready to book" call — to pull the
+//      booking-ready detail the list omits (segment times, durations, baggage, fare conditions).
+//      It's a deterministic server-side enrichment, structurally like lib/currency.ts's FX pass:
+//      additive-or-nothing. Any failure degrades to the lean summary, so a priced plan never
+//      becomes unpriced over a slow detail fetch.
 // Like the verify verdict, the budget and the season, the price the UI shows is the TOOL's, never
 // a number the model claimed.
 
@@ -37,6 +49,10 @@ const USER_AGENT = "TravelAgentAI/0.1 (personal learning project)";
 const PLACES_TIMEOUT_MS = 6000;
 const SEARCH_TIMEOUT_MS = 25000;
 const OFFERS_TIMEOUT_MS = 9000;
+// The booking-detail GET /air/offers/{id} (the server-enrich pass) is a single quick read like the
+// offers list; bound it tightly so a slow enrichment can't stall a plan that's already priced. Any
+// failure here degrades to the lean summary — the fare still shows, just without the detail panel.
+const ENRICH_TIMEOUT_MS = 7000;
 const DAY_MS = 86_400_000;
 const DEFAULT_NIGHTS = 7; // return-date fallback when the model doesn't pass a night count
 const DEFAULT_LEAD_DAYS = 56; // ~8 weeks out when no travel month is known at all
@@ -170,6 +186,8 @@ async function resolvePlace(
 type DuffelSegment = unknown;
 type DuffelSlice = { segments?: DuffelSegment[] };
 type DuffelOffer = {
+  id?: string; // the offer ID — needed for the enrich GET and any future hold/order step
+  expires_at?: string | null; // ISO 8601; offers typically expire ~30 min after search
   total_amount?: string;
   total_currency?: string;
   live_mode?: boolean;
@@ -177,8 +195,105 @@ type DuffelOffer = {
   slices?: DuffelSlice[];
 };
 
+// The RICHER shape returned by GET /air/offers/{id} (the single-offer endpoint). The offers LIST
+// endpoint omits all of this — segment times, durations, per-passenger baggage, fare conditions —
+// which is why the enrich pass re-fetches the chosen offer by ID. Everything is optional: a missing
+// field just becomes null in the parsed FlightSummary, never a throw.
+type DuffelAirport = { iata_code?: string | null; city_name?: string | null };
+type DuffelCarrier = { iata_code?: string | null; name?: string | null };
+type DuffelPassengerBaggage = { type?: string; quantity?: number | null };
+type DuffelRichSegment = {
+  departing_at?: string | null;
+  arriving_at?: string | null;
+  duration?: string | null;
+  origin?: DuffelAirport;
+  destination?: DuffelAirport;
+  marketing_carrier?: DuffelCarrier;
+  marketing_carrier_flight_number?: string | null;
+  passengers?: { baggages?: DuffelPassengerBaggage[] }[];
+};
+type DuffelConditionClause = {
+  allowed?: boolean;
+  penalty_amount?: string | null;
+  penalty_currency?: string | null;
+} | null;
+type DuffelConditions = {
+  refund_before_departure?: DuffelConditionClause;
+  change_before_departure?: DuffelConditionClause;
+};
+type DuffelRichSlice = { segments?: DuffelRichSegment[]; conditions?: DuffelConditions };
+type DuffelRichOffer = DuffelOffer & { slices?: DuffelRichSlice[]; conditions?: DuffelConditions };
+
 const stopsFor = (slice: DuffelSlice | undefined): number | null =>
   slice && Array.isArray(slice.segments) ? Math.max(0, slice.segments.length - 1) : null;
+
+// Parse Duffel's ISO-8601 segment duration ("PT6H30M", "P1DT2H15M") to whole minutes, or null on a
+// missing/malformed value. Days/hours/minutes only — flight legs never carry months or years.
+function parseDurationMinutes(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  // Days/hours/minutes/seconds — Duffel often appends a seconds component ("PT8H58M00S"); without
+  // the S group the anchored regex would reject the whole string and silently drop the duration.
+  // Seconds round down into minutes. Flight legs never carry months or years.
+  const m = iso.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
+  if (
+    !m ||
+    (m[1] === undefined && m[2] === undefined && m[3] === undefined && m[4] === undefined)
+  ) {
+    return null;
+  }
+  const days = m[1] ? parseInt(m[1], 10) : 0;
+  const hours = m[2] ? parseInt(m[2], 10) : 0;
+  const mins = m[3] ? parseInt(m[3], 10) : 0;
+  const secs = m[4] ? parseInt(m[4], 10) : 0;
+  return days * 1440 + hours * 60 + mins + Math.floor(secs / 60);
+}
+
+// Collapse a slice's per-segment, per-passenger baggage into ONE allowance: the MIN quantity across
+// every segment (if any leg bans a checked bag, the whole routing effectively does). null when no
+// segment reports that type — shown as "allowance not specified" rather than a misleading "0".
+function sliceBaggageFor(slice: DuffelRichSlice): SliceBaggage {
+  let checked: number | null = null;
+  let carryOn: number | null = null;
+  for (const seg of slice.segments ?? []) {
+    for (const pax of seg.passengers ?? []) {
+      for (const bag of pax.baggages ?? []) {
+        if (typeof bag.quantity !== "number") continue;
+        if (bag.type === "checked") {
+          checked = checked === null ? bag.quantity : Math.min(checked, bag.quantity);
+        } else if (bag.type === "carry_on") {
+          carryOn = carryOn === null ? bag.quantity : Math.min(carryOn, bag.quantity);
+        }
+      }
+    }
+  }
+  return { checkedQuantity: checked, carryOnQuantity: carryOn };
+}
+
+// Flatten Duffel's offer-level refund/change clauses into our FlightConditions. The *Home fields are
+// filled later by a server-side FX pass (the penalty currency can differ from the fare currency). A
+// penalty_amount is a STRING ("75.00") and may be null while allowed is true — "refundable, penalty
+// unknown" — which the UI distinguishes from a genuine zero penalty.
+function parseConditions(c: DuffelConditions | undefined): FlightConditions | null {
+  if (!c) return null;
+  const r = c.refund_before_departure;
+  const ch = c.change_before_departure;
+  const amt = (v: string | null | undefined): number | null => {
+    if (v == null) return null;
+    const n = Number.parseFloat(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    refundable: r ? (r.allowed ?? null) : null,
+    refundPenaltyAmount: amt(r?.penalty_amount),
+    refundPenaltyCurrency: r?.penalty_currency ?? null,
+    refundPenaltyHome: null,
+    changeable: ch ? (ch.allowed ?? null) : null,
+    changePenaltyAmount: amt(ch?.penalty_amount),
+    changePenaltyCurrency: ch?.penalty_currency ?? null,
+    changePenaltyHome: null,
+    penaltyHomeCurrency: null,
+  };
+}
 
 // Turn the cheapest Duffel offer + the search context into the FlightSummary the UI renders.
 // Pure (no network) so the shaping logic can be checked against a recorded payload without a key.
@@ -213,12 +328,14 @@ export function summarizeOffer(
   } (excludes bags and seat fees).`;
   const note = testMode
     ? `${basis} ⚠ TEST DATA: these are synthetic fares from Duffel's test environment, not real bookable prices — set a live Duffel key for real fares.`
-    : `${basis} A live fare snapshot — prices move, so treat it as a ballpark.`;
+    : `${basis} A live fare snapshot — prices move, and Duffel offers typically expire within ~30 minutes of search; treat this as a planning reference, not a booking confirmation.`;
 
   return {
     source: "duffel",
     testMode,
     origin: ctx.origin,
+    offerId: offer.id,
+    expiresAt: offer.expires_at ?? null,
     legs,
     totalAmount: Number.isFinite(amount) ? Math.round(amount) : null,
     currency: offer.total_currency ?? null,
@@ -233,6 +350,52 @@ const unavailable = (
   reason: FlightUnavailable["reason"],
   note: string,
 ): FlightUnavailable => ({ source: "unavailable", origin, reason, note });
+
+// Build the booking-ready detail from the RICH single-offer payload and merge it onto the lean
+// summary. Pure (no network) so it's testable against a recorded /air/offers/{id} body. An expired
+// offer keeps its (authoritative) price but withholds the segment/baggage/conditions detail — we
+// won't dress an unbookable offer as "the flight you'd book"; we flag it and prompt a re-search.
+export function enrichSummary(lean: FlightSummary, rich: DuffelRichOffer): FlightSummary {
+  const offerId = rich.id ?? lean.offerId;
+  const expiresAt = rich.expires_at ?? null;
+  const expired = expiresAt ? new Date(expiresAt).getTime() < Date.now() : false;
+  if (expired) {
+    return {
+      ...lean,
+      offerId,
+      expiresAt,
+      note:
+        "This offer has expired and can no longer be booked — the price shown was valid at search time; re-plan to get a current fare.",
+    };
+  }
+  const richSlices = (rich.slices ?? []) as DuffelRichSlice[];
+  return {
+    ...lean,
+    offerId,
+    expiresAt,
+    sliceSegments: richSlices.map((sl) =>
+      (sl.segments ?? []).map(
+        (seg): FlightSegmentDetail => ({
+          departingAt: seg.departing_at ?? null,
+          arrivingAt: seg.arriving_at ?? null,
+          durationMinutes: parseDurationMinutes(seg.duration),
+          origin: seg.origin?.iata_code ?? null,
+          originCity: seg.origin?.city_name ?? null,
+          destination: seg.destination?.iata_code ?? null,
+          destinationCity: seg.destination?.city_name ?? null,
+          flightDesignator:
+            [seg.marketing_carrier?.iata_code, seg.marketing_carrier_flight_number]
+              .filter(Boolean)
+              .join("") || null,
+          carrierName: seg.marketing_carrier?.name ?? null,
+        }),
+      ),
+    ),
+    sliceBaggage: richSlices.map(sliceBaggageFor),
+    conditions:
+      parseConditions(rich.conditions) ?? parseConditions(richSlices[0]?.conditions) ?? null,
+  };
+}
 
 // --- public entry point — executes the find_flights tool --------------------------------------
 
@@ -348,25 +511,55 @@ export async function findFlights(
     }
 
     onProgress?.("Pricing the cheapest fare");
-    return summarizeOffer(cheapest, {
+    const ctx = {
       origin,
-      out: {
-        fromCity: origin,
-        fromCode: o.code,
-        toCity: arriveCity,
-        toCode: a.code,
-        date: outISO,
-      },
-      back: {
-        fromCity: returnFromCity,
-        fromCode: back.code,
-        toCity: origin,
-        toCode: o.code,
-        date: retISO,
-      },
+      out: { fromCity: origin, fromCode: o.code, toCity: arriveCity, toCode: a.code, date: outISO },
+      back: { fromCity: returnFromCity, fromCode: back.code, toCity: origin, toCode: o.code, date: retISO },
       month: input.month,
       apiKey,
-    });
+    };
+    // Lean summary from the LIST offer — always valid, always has the price and route. If the
+    // enrich pass below fails, this is exactly what we return (additive-or-nothing, like the FX pass).
+    let summary = summarizeOffer(cheapest, ctx);
+
+    // --- The server-enrich pass ---------------------------------------------------------------
+    // A second, server-to-server GET /air/offers/{id} pulls the booking-ready detail the LIST
+    // endpoint omits (segment times, durations, baggage, fare conditions). The offer ID is Duffel's
+    // own (never the model's), so it's trusted; encodeURIComponent is belt-and-suspenders. We
+    // re-summarize from the AUTHORITATIVE single-offer payload (its price can differ from the
+    // list's), keeping the ID, price, legs, and detail mutually consistent. Any failure — timeout,
+    // 429, 404 on an already-expired offer, a malformed body — degrades to the lean summary: a
+    // priced plan never becomes unpriced over a slow or failed detail fetch.
+    if (cheapest.id) {
+      try {
+        onProgress?.("Fetching booking detail");
+        const enrichRes = await duffelFetch(
+          `/air/offers/${encodeURIComponent(cheapest.id)}`,
+          apiKey,
+          { timeoutMs: ENRICH_TIMEOUT_MS, signal },
+        );
+        if (enrichRes.ok) {
+          const rich = ((await enrichRes.json()) as { data?: DuffelRichOffer }).data;
+          if (rich) {
+            // Re-price from the authoritative single-offer body, but if it came back without a
+            // total_amount (a 200 with an incomplete body), keep the list price — a priced plan must
+            // never silently become unpriced over the detail fetch (the additive-or-nothing rule).
+            const richLean = summarizeOffer(rich, ctx);
+            summary = enrichSummary(
+              richLean.totalAmount != null
+                ? richLean
+                : { ...richLean, totalAmount: summary.totalAmount, currency: summary.currency },
+              rich,
+            );
+          }
+        } else {
+          console.warn(`Duffel offer-detail HTTP ${enrichRes.status}; using lean summary.`);
+        }
+      } catch {
+        console.warn("Duffel offer-detail enrich failed; using lean summary.");
+      }
+    }
+    return summary;
   } catch (err) {
     if (signal?.aborted) return unavailable(origin, "error", "Search was cancelled.");
     console.warn("Duffel flight search error:", err);
@@ -376,7 +569,9 @@ export async function findFlights(
 
 // A compact, model-facing view of the result for the tool_result — the model needs the gist (did
 // it work, what's the round-trip price, is it test data) to weave one honest line into its plan,
-// not the full structured payload. The full detail goes to the UI via the server attach.
+// not the full structured payload. The full detail goes to the UI via the server attach. The
+// booking-ready detail (segment times, baggage, conditions) is DELIBERATELY omitted here: the model
+// can't cite specifics it never received, so it can't contradict the UI card the server attaches.
 //
 // `price` leads with the HOME-currency fare (attached by the route's FX pass) so the model cites
 // the same figure the FlightsBlock shows — never the raw Duffel currency, which a test fare can
@@ -384,6 +579,12 @@ export async function findFlights(
 export function flightModelView(result: FlightResult): unknown {
   if (result.source === "unavailable") {
     return { available: false, reason: result.reason, note: result.note };
+  }
+  // An offer that expired between search and emit keeps its (authoritative) price for the UI's
+  // expired card, but the MODEL must hear it's unavailable so its prose can't claim a bookable fare
+  // while the card reads "expired" — keep the two consistent.
+  if (result.expiresAt && new Date(result.expiresAt).getTime() < Date.now()) {
+    return { available: false, reason: "expired", note: result.note };
   }
   const route = result.legs
     .map((l) => `${l.fromCode}→${l.toCode} ${l.date}`)
