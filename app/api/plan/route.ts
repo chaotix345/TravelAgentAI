@@ -4,7 +4,9 @@ import {
   itineraryJsonSchema,
   itinerarySchema,
   type BudgetSummary,
+  type CitySeasonSummary,
   type Itinerary,
+  type SeasonSummary,
   type VerifiedItinerary,
   type VerifyStatus,
 } from "@/lib/schema";
@@ -12,6 +14,7 @@ import { SYSTEM_PROMPT } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
+import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
 
 // The Anthropic SDK needs the Node runtime (not edge).
 export const runtime = "nodejs";
@@ -36,14 +39,14 @@ const MAX_REFINE_ITINERARY_CHARS = 200_000;
 // annotated prior plan, but stops a multi-MB body from being buffered and parsed at all.
 const MAX_BODY_CHARS = 1_000_000;
 // Backstop on agent-loop iterations. Happy path: 2 model turns for a single-city trip with no
-// budget angle (verify, then a forced emit), or 3 if it prices (verify -> estimate_costs -> emit).
-// A multi-city trip adds an optional check_route, which runs before cost (verify -> check_route ->
-// estimate_costs -> emit = 4). We allow the model ONE retry if it calls verify with no usable
-// places (capped below by EMPTY_VERIFY_RETRIES), so the worst legitimate path is verify-retry ->
-// verify -> check_route -> estimate_costs -> emit = 5 turns; 6 leaves a turn of headroom. Each
-// optional tool is gated to one use, so the loop can't spin. Guards against anything unexpected so
-// a request can't run forever.
-const MAX_TURNS = 6;
+// budget/timing angle (verify, then a forced emit). Each optional grounding tool the agent
+// chooses to use adds one turn: estimate_costs and best_time_to_go (single-city), or
+// check_route + estimate_costs + best_time_to_go (multi-city), each gated to a single use. So
+// the longest legitimate path is verify-retry -> verify -> check_route -> estimate_costs ->
+// best_time_to_go -> emit = 6 turns; 7 leaves a turn of headroom. Each optional tool is gated
+// to one use, so the loop can't spin. Guards against anything unexpected so a request can't run
+// forever.
+const MAX_TURNS = 7;
 // How many times the model may call verify_places with nothing checkable before
 // we give up with a clear error (instead of silently burning the turn budget).
 const EMPTY_VERIFY_RETRIES = 1;
@@ -77,11 +80,11 @@ function rateLimited(ip: string): boolean {
   return false;
 }
 
-// The tools the planner can use. verify_places and check_route are OURS to execute
-// (they call free geo databases); emit_itinerary is the structured "I'm done"
-// signal. Which tools are offered — and which one is forced — varies per turn (see
-// the loop), so verify-then-emit stays structural: a plan can't be emitted before
-// its places are grounded.
+// The tools the planner can use. verify_places, check_route, estimate_costs and best_time_to_go
+// are OURS to execute (they call free, keyless databases); emit_itinerary is the structured
+// "I'm done" signal. Which tools are offered — and which one is forced — varies per turn (see
+// the loop), so verify-then-emit stays structural: a plan can't be emitted before its places
+// are grounded.
 const VERIFY_PLACES_TOOL: Anthropic.Tool = {
   name: "verify_places",
   description:
@@ -166,6 +169,38 @@ const ESTIMATE_COSTS_TOOL: Anthropic.Tool = {
   } as Anthropic.Tool.InputSchema,
 };
 
+const BEST_TIME_TOOL: Anthropic.Tool = {
+  name: "best_time_to_go",
+  description:
+    "Ground the TIMING of your plan in real climate data. Pass your cities (with country), and — if the brief implies WHEN they travel ('in August', 'next spring', specific dates) — the targetMonth (1-12) of the trip. Returns, per city, a 'best months to go' window and a peak/shoulder/off-season weather label for each month, derived from Open-Meteo climate normals (real observed weather, no key); if you gave a targetMonth, it assesses that month at each city. Use it to: time a flexible trip to the best window, WARN the traveler when their chosen month is harsh (peak heat, monsoon, deep winter) and suggest a better one, and tailor day plans to the actual conditions (indoor/early-start in extreme heat, rain backups in a wet month). It grounds WEATHER comfort only — not tourist crowds or prices, which depend on holidays and festivals — so never claim crowd levels from it. Call this when timing matters: the brief gives or leaves open the dates, the destination has a strong season (Mediterranean summer, tropical monsoon, far-north winter), or shifting the month would clearly help.",
+  input_schema: {
+    type: "object",
+    properties: {
+      cities: {
+        type: "array",
+        minItems: 1,
+        description: "Your cities to assess for seasonality.",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "City name." },
+            country: { type: "string", description: "Country (to locate the city accurately)." },
+          },
+          required: ["name"],
+        },
+      },
+      targetMonth: {
+        type: "integer",
+        minimum: 1,
+        maximum: 12,
+        description:
+          "The calendar month the trip is for (1=January … 12=December), inferred from the brief. Use the actual month(s) of travel — never assume 'summer' means a fixed month, since that flips by hemisphere. Omit entirely if the brief gives no timing.",
+      },
+    },
+    required: ["cities"],
+  } as Anthropic.Tool.InputSchema,
+};
+
 const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
   name: "emit_itinerary",
   description:
@@ -175,12 +210,12 @@ const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
 
 // The progress events we stream to the browser, one JSON object per line (NDJSON).
 // The client switches on `type`. Phases mirror the agent loop: draft -> verify ->
-// (route) -> finalize. On routing/verifying events, `done`/`total` drive the
-// progress bar and `name` (routing) names the city being located.
+// (route) -> (price) -> (timing) -> finalize. On routing/verifying/pricing/timing events,
+// `done`/`total` drive the progress bar and `name` names the city being located.
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -192,6 +227,24 @@ type PlanEvent =
 // Fold case and accents so "Pastéis de Belém" matches "pasteis de belem".
 const norm = (s: string) =>
   s.normalize("NFD").replace(/\p{Diacritic}/gu, "").trim().toLowerCase();
+
+// Tool inputs aren't strictly validated by the API, and the model occasionally returns an
+// array-valued field as a JSON STRING ("[{...}]") rather than a real array — observed in the
+// wild on verify_places. A bare Array.isArray check treats that as empty, which silently fails
+// the plan (or burns the empty-verify retry). coerceArray passes a real array through and
+// recovers a stringified one, so a quirk in the model's tool output doesn't sink the request.
+function coerceArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      /* not JSON — fall through to [] */
+    }
+  }
+  return [];
+}
 
 // Attach our verification verdicts to the finished plan. The truth comes from what
 // our tool actually found, not from anything the model claims about its own places.
@@ -208,6 +261,9 @@ function annotateItinerary(
   // computed — not anything the model wrote — so the displayed numbers are grounded, the same
   // way the verify verdict is ours. null when the agent didn't price the trip.
   costEstimate: CostEstimate | null,
+  // The last best_time_to_go result, if the agent ran one. Same deal: the season labels the UI
+  // shows are the tool's, not the model's. null when the agent didn't assess timing.
+  season: SeasonSummary | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -231,17 +287,25 @@ function annotateItinerary(
   // Index the tool's per-city cost by folded city name so we can hang it on the matching city.
   const costByCity = new Map<string, CityCost>();
   if (costEstimate) for (const c of costEstimate.cities) costByCity.set(norm(c.name), c);
+  // Same for the per-city season summary.
+  const seasonByCity = new Map<string, CitySeasonSummary>();
+  if (season) for (const c of season.cities) seasonByCity.set(norm(c.name), c);
 
-  // Build the cities, collecting the per-city costs that actually matched a city in the FINAL
-  // plan. We recompute the headline budget from just these, so the total always equals the sum of
-  // the per-city figures shown — even if the model changed the city set between pricing and emit.
+  // Build the cities, collecting the per-city costs/seasons that actually matched a city in the
+  // FINAL plan. We recompute the headline budget (and target-month season verdict) from just
+  // these, so what's shown always reflects the city set in the plan — even if the model changed
+  // it between a grounding call and emit.
   const matched: CityCost[] = [];
+  const matchedSeason: CitySeasonSummary[] = [];
   const cities = itinerary.cities.map((city) => {
     const cc = costByCity.get(norm(city.name));
     if (cc) matched.push(cc);
+    const sc = seasonByCity.get(norm(city.name));
+    if (sc) matchedSeason.push(sc);
     return {
       ...city,
       ...(cc ? { cost: { tier: cc.tier, dailyUsd: cc.dailyUsd, anchors: cc.anchors } } : {}),
+      ...(sc && sc.source === "open-meteo" ? { season: sc } : {}),
       days: city.days.map((day) => ({
         label: day.label,
         morning: { ...day.morning, ...verdict(day.morning.name) },
@@ -276,7 +340,28 @@ function annotateItinerary(
     };
   }
 
-  return { ...itinerary, ...(budget ? { budget } : {}), cities };
+  // Attach the season only if a grounded city actually appears in the plan (drops a vacuous or
+  // fully-cut assessment). Recompute the target-month verdict from the cities that survived, so
+  // it can't name a city the model dropped after the assessment ran.
+  let seasonOut: SeasonSummary | undefined;
+  if (season && matchedSeason.some((c) => c.source === "open-meteo")) {
+    seasonOut = {
+      cities: matchedSeason,
+      targetMonth: season.targetMonth,
+      targetAssessment: season.targetMonth
+        ? seasonTargetLine(matchedSeason, season.targetMonth)
+        : null,
+      note: season.note,
+      caveat: season.caveat,
+    };
+  }
+
+  return {
+    ...itinerary,
+    ...(budget ? { budget } : {}),
+    ...(seasonOut ? { season: seasonOut } : {}),
+    cities,
+  };
 }
 
 export async function POST(req: Request) {
@@ -417,8 +502,11 @@ export async function POST(req: Request) {
       let verifiedOnce = false; // have we run a real place-verification round yet?
       let routedOnce = false; // has the model used its one check_route round?
       let costedOnce = false; // has the model used its one estimate_costs round?
+      let seasonedOnce = false; // has the model used its one best_time_to_go round?
       // The grounded budget from the last estimate_costs call, attached to the final plan.
       let costEstimate: CostEstimate | null = null;
+      // The grounded seasonality from the last best_time_to_go call, attached to the final plan.
+      let seasonEstimate: SeasonSummary | null = null;
       // Does the plan span 2+ cities? Gates the check_route turn. Seed it from the prior
       // plan on a refine so a multi-city refine still gets a route check even if the model's
       // verify batch happens to under-represent the cities; the post-verify recompute below
@@ -435,7 +523,7 @@ export async function POST(req: Request) {
           // a multi-city trip gets ONE optional check_route turn (the model chooses
           // route-or-emit), then emit is forced. Single-city trips skip straight to a
           // forced emit: there's no route to check.
-          let phase: "drafting" | "routing" | "pricing" | "finalizing";
+          let phase: "drafting" | "routing" | "pricing" | "timing" | "finalizing";
           let toolsForTurn: Anthropic.Tool[];
           let toolChoice: Anthropic.ToolChoice;
           if (!verifiedOnce) {
@@ -449,26 +537,28 @@ export async function POST(req: Request) {
             toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
           } else {
             // Places are grounded. Offer the OPTIONAL grounding tools the agent hasn't spent
-            // yet — check_route (multi-city only) and estimate_costs — alongside emit, and let
-            // the model choose (the prompt steers when each earns its turn). Each is gated to a
-            // single use, so the loop can't spin: at most one route turn + one cost turn before
-            // emit. disable_parallel_tool_use keeps it to exactly one tool_use per response, the
-            // same invariant every other turn relies on. When no optional tool is left, force
-            // the final emit. (verify_places stays the sole forced tool on turn 0, so place
-            // grounding is still structural — only route/cost are the agent's call.)
+            // yet — check_route (multi-city only), estimate_costs and best_time_to_go —
+            // alongside emit, and let the model choose (the prompt steers when each earns its
+            // turn). Each is gated to a single use, so the loop can't spin: at most one route +
+            // one cost + one timing turn before emit. disable_parallel_tool_use keeps it to
+            // exactly one tool_use per response, the same invariant every other turn relies on.
+            // When no optional tool is left, force the final emit. (verify_places stays the sole
+            // forced tool on turn 0, so place grounding is still structural — route/cost/timing
+            // are the agent's call.)
             const optional: Anthropic.Tool[] = [];
             if (multiCity && !routedOnce) optional.push(CHECK_ROUTE_TOOL);
-            // Offer cost only once the route is settled (or there's no route to settle), so the
-            // budget is computed against the FINAL city set — not one check_route may still
-            // reorder or drop. Enforces the prompt's "price once the cities are settled" at the
-            // loop level instead of trusting the model to sequence it.
+            // Offer cost and timing only once the route is settled (or there's no route to
+            // settle), so they're computed against the FINAL city set — not one check_route may
+            // still reorder or drop. Enforces the prompt's "ground once the cities are settled"
+            // at the loop level instead of trusting the model to sequence it.
             if (!costedOnce && (!multiCity || routedOnce)) optional.push(ESTIMATE_COSTS_TOOL);
+            if (!seasonedOnce && (!multiCity || routedOnce)) optional.push(BEST_TIME_TOOL);
             if (optional.length > 0) {
               // Pre-decision label: name the work most likely to run next so the UI shows a
               // sensible phase before the model picks. Routing comes first on a multi-city trip;
-              // otherwise the only optional tool on offer is cost. The precise per-tool status
-              // fires when the chosen tool actually runs (or finalizing if it emits instead).
-              phase = multiCity && !routedOnce ? "routing" : "pricing";
+              // otherwise cost, then timing. The precise per-tool status fires when the chosen
+              // tool actually runs (or finalizing if it emits instead).
+              phase = multiCity && !routedOnce ? "routing" : !costedOnce ? "pricing" : "timing";
               toolsForTurn = [...optional, EMIT_ITINERARY_TOOL];
               toolChoice = { type: "any", disable_parallel_tool_use: true };
             } else {
@@ -549,31 +639,23 @@ export async function POST(req: Request) {
               ...parsed.data,
               totalNights: parsed.data.cities.reduce((sum, c) => sum + c.nights, 0),
             };
-            // If the model emitted straight off an optional turn (pricing/routing was the last
-            // label), transition cleanly to finalizing before the plan paints.
+            // If the model emitted straight off an optional turn (pricing/routing/timing was the
+            // last label), transition cleanly to finalizing before the plan paints.
             send({ type: "status", phase: "finalizing" });
             send({
               type: "itinerary",
-              itinerary: annotateItinerary(itinerary, verifyCache, costEstimate),
+              itinerary: annotateItinerary(itinerary, verifyCache, costEstimate, seasonEstimate),
             });
             return;
           }
 
           if (toolUse.name === "verify_places") {
             const input = toolUse.input as { places?: unknown };
-            // Tool inputs aren't strictly validated, so the model can return `places` as
-            // something other than an array (the larger refine context makes this more
-            // likely). Guard the type — a non-array falls into the empty-verify retry below
-            // instead of throwing. (`?? []` alone only guards null/undefined.)
-            if (input.places != null && !Array.isArray(input.places)) {
-              console.warn(
-                "verify_places: non-array places:",
-                JSON.stringify(input.places).slice(0, 300),
-              );
-            }
-            const rawPlaces = Array.isArray(input.places)
-              ? (input.places as Array<{ name?: unknown; city?: unknown }>)
-              : [];
+            // coerceArray passes a real array through and recovers a stringified one (the model
+            // sometimes returns `places` as a JSON string, especially in the larger refine
+            // context) — so a malformed-but-recoverable input doesn't fail the plan or burn the
+            // empty-verify retry. A truly empty/unrecoverable input still falls through below.
+            const rawPlaces = coerceArray(input.places) as Array<{ name?: unknown; city?: unknown }>;
             const places = rawPlaces
               .filter(
                 (p): p is { name: string; city?: unknown } =>
@@ -634,11 +716,9 @@ export async function POST(req: Request) {
 
           if (toolUse.name === "check_route") {
             const input = toolUse.input as { cities?: unknown };
-            // Same guard as verify_places: a non-array `cities` shouldn't throw. An empty
-            // result just means checkRoute reports nothing to check and we move to emit.
-            const rawCities = Array.isArray(input.cities)
-              ? (input.cities as Array<{ name?: unknown; country?: unknown }>)
-              : [];
+            // Same coercion as verify_places: pass an array through, recover a stringified one.
+            // An empty result just means checkRoute has nothing to check and we move to emit.
+            const rawCities = coerceArray(input.cities) as Array<{ name?: unknown; country?: unknown }>;
             const cities = rawCities
               .filter(
                 (c): c is { name: string; country?: unknown } =>
@@ -668,10 +748,12 @@ export async function POST(req: Request) {
           if (toolUse.name === "estimate_costs") {
             const input = toolUse.input as { style?: unknown; cities?: unknown };
             const style = parseStyle(input.style);
-            // Same defensive guard as the other tools: a non-array `cities` shouldn't throw.
-            const rawCities = Array.isArray(input.cities)
-              ? (input.cities as Array<{ name?: unknown; country?: unknown; nights?: unknown }>)
-              : [];
+            // Same coercion as the other tools: pass an array through, recover a stringified one.
+            const rawCities = coerceArray(input.cities) as Array<{
+              name?: unknown;
+              country?: unknown;
+              nights?: unknown;
+            }>;
             const cities = rawCities
               .filter(
                 (c): c is { name: string; country?: unknown; nights?: unknown } =>
@@ -717,7 +799,63 @@ export async function POST(req: Request) {
               ],
             });
             costedOnce = true;
-            continue; // back to the top — next turn the model checks the route or emits
+            continue; // back to the top — next turn the model assesses timing or emits
+          }
+
+          if (toolUse.name === "best_time_to_go") {
+            const input = toolUse.input as { cities?: unknown; targetMonth?: unknown };
+            const targetMonth = parseTargetMonth(input.targetMonth);
+            // Same coercion as the other tools: pass an array through, recover a stringified one.
+            const rawCities = coerceArray(input.cities) as Array<{ name?: unknown; country?: unknown }>;
+            const cities = rawCities
+              .filter(
+                (c): c is { name: string; country?: unknown } =>
+                  !!c && typeof c.name === "string" && c.name.trim().length > 0,
+              )
+              .map((c) => ({
+                name: c.name.trim(),
+                country: typeof c.country === "string" ? c.country.trim() : undefined,
+              }));
+
+            if (cities.length === 0) {
+              // Nothing to assess. Consume the option (so we don't re-offer and risk a loop) and
+              // move on WITHOUT season grounding rather than attach a vacuous one.
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content:
+                      "No valid cities were provided. Emit the plan without season grounding.",
+                  },
+                ],
+              });
+              seasonedOnce = true;
+              continue;
+            }
+
+            send({ type: "status", phase: "timing", done: 0, total: cities.length });
+            const season = await assessSeason(
+              cities,
+              targetMonth,
+              (done, total, name) => send({ type: "status", phase: "timing", done, total, name }),
+              req.signal,
+            );
+            seasonEstimate = season; // attached to the final plan as the grounded seasonality
+            // Send the model a trimmed view (the full 12-month × N-city payload is token-heavy).
+            messages.push({
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(seasonModelView(season)),
+                },
+              ],
+            });
+            seasonedOnce = true;
+            continue; // back to the top — next turn the model prices/emits
           }
 
           // Unknown tool name — bail rather than loop forever.

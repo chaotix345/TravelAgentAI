@@ -94,8 +94,48 @@ export type BudgetSummary = {
   note: string;
   flags: string[];
 };
-export type VerifiedCity = Omit<City, "days"> & { days: VerifiedDay[]; cost?: CityCostSummary };
+// Same Approach-B idea applied to TIMING: when the model calls best_time_to_go, the route grounds
+// each city's seasonality in real climate normals (Open-Meteo ERA5) and attaches the result here.
+// Like the verify verdict and the budget, the displayed labels are OURS (computed in lib/season.ts),
+// not a claim the model made. Self-contained (no server-only import) so the client bundle stays clean.
+export type SeasonLabel = "peak" | "shoulder" | "off" | "best-available";
+export type MonthSeason = {
+  month: number; // 1–12
+  label: SeasonLabel;
+  comfort: number; // 0–10 traveler-comfort score
+  meanMaxC: number; // mean daily high, °C
+  meanTempC: number; // mean daily temp, °C
+  precipMm: number; // average monthly precipitation total, mm
+  rainDays: number; // average days/month with ≥1mm
+  temp: string; // descriptor, e.g. "warm"
+  rain: string; // descriptor, e.g. "mostly dry"
+  flags: string[]; // e.g. "rainy season — expect downpours"
+};
+export type CitySeasonSummary = {
+  name: string;
+  country?: string;
+  geocoded: boolean;
+  source: "open-meteo" | "none";
+  tropical: boolean; // season driven by rain, not temperature
+  challenging: boolean; // no genuinely comfortable month (we label the least-bad)
+  months: MonthSeason[]; // length 12 (index 0 = January), or [] when source === "none"
+  bestWindow: string; // headline "best months to go", e.g. "Best: Apr–Jun & Sep–Oct"
+};
+export type SeasonSummary = {
+  cities: CitySeasonSummary[];
+  targetMonth: number | null; // 1–12, the month the model inferred the trip is for (if any)
+  targetAssessment: string | null; // one-line verdict on the target month across the cities
+  note: string; // data-source disclosure
+  caveat: string; // weather-vs-crowds honesty disclaimer
+};
+
+export type VerifiedCity = Omit<City, "days"> & {
+  days: VerifiedDay[];
+  cost?: CityCostSummary;
+  season?: CitySeasonSummary;
+};
 export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
   cities: VerifiedCity[];
   budget?: BudgetSummary;
+  season?: SeasonSummary;
 };
