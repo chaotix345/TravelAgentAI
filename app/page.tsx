@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useState } from "react";
 import type {
   VerifiedItinerary,
   VerifiedDay,
@@ -720,13 +720,20 @@ function fmtTime(iso: string | null): string {
 // "0 = no checked bag" from "null = Duffel didn't report it" — never shows a misleading "0 bags".
 function BaggageLine({ baggage }: { baggage: SliceBaggage }) {
   const n = baggage.checkedQuantity;
-  const text =
+  const checkedText =
     n == null
       ? "Checked-bag allowance not specified"
       : n === 0
         ? "No checked bag included"
         : `${n} checked bag${n === 1 ? "" : "s"} included`;
-  return <p className="flights-baggage">{text}</p>;
+  const c = baggage.carryOnQuantity;
+  const carryText = c != null && c > 0 ? ` · ${c} carry-on` : "";
+  return (
+    <p className="flights-baggage">
+      {checkedText}
+      {carryText}
+    </p>
+  );
 }
 
 // Offer-level fare rules from the enrich pass. Leads with the home-currency penalty when the FX pass
@@ -778,12 +785,23 @@ function ConditionsRow({ conditions }: { conditions: FlightConditions }) {
 
 function FlightsBlock({ flights }: { flights: FlightSummary }) {
   const [detailOpen, setDetailOpen] = useState(false);
-  // Offer expiry is computed CLIENT-SIDE on every render from the stored timestamp — no server
-  // round-trip. A plan reopened hours later flips to the expired state on its own, and a refine's
-  // fresh search overwrites expiresAt. testMode offers carry a synthetic expiry, so we gate all
-  // expiry framing on a real (non-test) fare.
-  const expiryMs = flights.expiresAt ? new Date(flights.expiresAt).getTime() : null;
+  // Offer expiry is computed CLIENT-SIDE from the stored timestamp — no server round-trip. A plan
+  // reopened later recomputes it on mount; for a tab left open we arm a one-shot timer that
+  // re-renders exactly at expiry. A refine's fresh search overwrites expiresAt. testMode offers
+  // carry a synthetic expiry, so we gate all expiry framing on a real (non-test) fare. Treat a null
+  // OR malformed (NaN) timestamp as "no usable expiry" — Number.isFinite rejects both, so a bad
+  // string can't read as "valid forever".
+  const [, bumpClock] = useReducer((n: number) => n + 1, 0);
+  const rawExpiry = flights.expiresAt ? new Date(flights.expiresAt).getTime() : null;
+  const expiryMs = rawExpiry != null && Number.isFinite(rawExpiry) ? rawExpiry : null;
   const isExpired = expiryMs != null && Date.now() > expiryMs;
+  useEffect(() => {
+    if (expiryMs == null) return;
+    const delay = expiryMs - Date.now();
+    if (delay <= 0) return; // already past — this render already reflects the expired state
+    const t = setTimeout(bumpClock, delay);
+    return () => clearTimeout(t);
+  }, [expiryMs]);
   // Stops come from the outbound leg the tool counted; the card was silently dropping this.
   const outStops = flights.legs[0]?.stops ?? null;
   const stopsLabel =
@@ -871,23 +889,24 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
         />
       )}
       {!flights.testMode && expiryMs != null && !isExpired && (
-        <p className="flights-expiry">Fare valid for roughly 30 minutes from search — prices change.</p>
+        <p className="flights-expiry">Offers typically expire about 30 minutes after search — prices change.</p>
       )}
       {!flights.testMode && isExpired && (
         <p className="flights-expiry warn">This offer has expired — re-plan to get a current fare.</p>
       )}
-      {flights.sliceSegments && flights.sliceSegments.length > 0 && !isExpired && (
+      {flights.sliceSegments && flights.sliceSegments.length > 0 && (!isExpired || flights.testMode) && (
         <>
           <button
             type="button"
             className="flights-detail-btn"
+            aria-controls="flights-detail-panel"
             aria-expanded={detailOpen}
             onClick={() => setDetailOpen((o) => !o)}
           >
             {detailOpen ? "Hide flight details" : "Show flight details"}
           </button>
           {detailOpen && (
-            <div className="flights-detail">
+            <div className="flights-detail" id="flights-detail-panel">
               {flights.testMode && (
                 <p className="flights-detail-test">
                   Illustrative detail from Duffel&apos;s test environment — not a real flight.
@@ -898,8 +917,10 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
                   <p className="flights-slice-label">{si === 0 ? "Outbound" : "Return"}</p>
                   {segs.map((seg, gi) => (
                     <div className="flights-segment" key={gi}>
-                      {gi > 0 && segs[gi - 1].destinationCity && (
-                        <p className="flights-connection">Connect in {segs[gi - 1].destinationCity}</p>
+                      {gi > 0 && (segs[gi - 1].destinationCity || segs[gi - 1].destination) && (
+                        <p className="flights-connection">
+                          Connect in {segs[gi - 1].destinationCity ?? segs[gi - 1].destination}
+                        </p>
                       )}
                       <div className="flights-seg-line">
                         <span className="flights-seg-route">

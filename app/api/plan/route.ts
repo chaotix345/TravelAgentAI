@@ -1252,8 +1252,10 @@ export async function POST(req: Request) {
                 ),
               );
               if (penaltyCurrencies.size > 0) {
-                send({ type: "status", phase: "flights", name: "converting to " + HOME });
                 for (const cur of penaltyCurrencies) {
+                  // Heartbeat inside the loop: a second penalty currency means a second ~4s getRate,
+                  // and the flight heartbeat is already cleared — keep an event flowing each iteration.
+                  send({ type: "status", phase: "flights", name: "converting to " + HOME });
                   const penaltyFx = await getRate(cur, HOME, req.signal);
                   if (!penaltyFx) continue;
                   updated.penaltyHomeCurrency = HOME;

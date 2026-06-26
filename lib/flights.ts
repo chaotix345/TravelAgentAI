@@ -231,17 +231,26 @@ const stopsFor = (slice: DuffelSlice | undefined): number | null =>
 // missing/malformed value. Days/hours/minutes only — flight legs never carry months or years.
 function parseDurationMinutes(iso: string | null | undefined): number | null {
   if (!iso) return null;
-  const m = iso.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$/);
-  if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined)) return null;
+  // Days/hours/minutes/seconds — Duffel often appends a seconds component ("PT8H58M00S"); without
+  // the S group the anchored regex would reject the whole string and silently drop the duration.
+  // Seconds round down into minutes. Flight legs never carry months or years.
+  const m = iso.match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
+  if (
+    !m ||
+    (m[1] === undefined && m[2] === undefined && m[3] === undefined && m[4] === undefined)
+  ) {
+    return null;
+  }
   const days = m[1] ? parseInt(m[1], 10) : 0;
   const hours = m[2] ? parseInt(m[2], 10) : 0;
   const mins = m[3] ? parseInt(m[3], 10) : 0;
-  return days * 1440 + hours * 60 + mins;
+  const secs = m[4] ? parseInt(m[4], 10) : 0;
+  return days * 1440 + hours * 60 + mins + Math.floor(secs / 60);
 }
 
 // Collapse a slice's per-segment, per-passenger baggage into ONE allowance: the MIN quantity across
 // every segment (if any leg bans a checked bag, the whole routing effectively does). null when no
-// segment reports that type — shown as "baggage details unavailable" rather than a misleading "0".
+// segment reports that type — shown as "allowance not specified" rather than a misleading "0".
 function sliceBaggageFor(slice: DuffelRichSlice): SliceBaggage {
   let checked: number | null = null;
   let carryOn: number | null = null;
@@ -326,6 +335,7 @@ export function summarizeOffer(
     testMode,
     origin: ctx.origin,
     offerId: offer.id,
+    expiresAt: offer.expires_at ?? null,
     legs,
     totalAmount: Number.isFinite(amount) ? Math.round(amount) : null,
     currency: offer.total_currency ?? null,
@@ -355,7 +365,7 @@ export function enrichSummary(lean: FlightSummary, rich: DuffelRichOffer): Fligh
       offerId,
       expiresAt,
       note:
-        "This offer has expired and can no longer be booked — the price shown was valid at search time; re-search for current fares.",
+        "This offer has expired and can no longer be booked — the price shown was valid at search time; re-plan to get a current fare.",
     };
   }
   const richSlices = (rich.slices ?? []) as DuffelRichSlice[];
@@ -382,7 +392,8 @@ export function enrichSummary(lean: FlightSummary, rich: DuffelRichOffer): Fligh
       ),
     ),
     sliceBaggage: richSlices.map(sliceBaggageFor),
-    conditions: parseConditions(rich.conditions),
+    conditions:
+      parseConditions(rich.conditions) ?? parseConditions(richSlices[0]?.conditions) ?? null,
   };
 }
 
@@ -529,7 +540,18 @@ export async function findFlights(
         );
         if (enrichRes.ok) {
           const rich = ((await enrichRes.json()) as { data?: DuffelRichOffer }).data;
-          if (rich) summary = enrichSummary(summarizeOffer(rich, ctx), rich);
+          if (rich) {
+            // Re-price from the authoritative single-offer body, but if it came back without a
+            // total_amount (a 200 with an incomplete body), keep the list price — a priced plan must
+            // never silently become unpriced over the detail fetch (the additive-or-nothing rule).
+            const richLean = summarizeOffer(rich, ctx);
+            summary = enrichSummary(
+              richLean.totalAmount != null
+                ? richLean
+                : { ...richLean, totalAmount: summary.totalAmount, currency: summary.currency },
+              rich,
+            );
+          }
         } else {
           console.warn(`Duffel offer-detail HTTP ${enrichRes.status}; using lean summary.`);
         }
@@ -557,6 +579,12 @@ export async function findFlights(
 export function flightModelView(result: FlightResult): unknown {
   if (result.source === "unavailable") {
     return { available: false, reason: result.reason, note: result.note };
+  }
+  // An offer that expired between search and emit keeps its (authoritative) price for the UI's
+  // expired card, but the MODEL must hear it's unavailable so its prose can't claim a bookable fare
+  // while the card reads "expired" — keep the two consistent.
+  if (result.expiresAt && new Date(result.expiresAt).getTime() < Date.now()) {
+    return { available: false, reason: "expired", note: result.note };
   }
   const route = result.legs
     .map((l) => `${l.fromCode}→${l.toCode} ${l.date}`)
