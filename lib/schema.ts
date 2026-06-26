@@ -128,6 +128,34 @@ export type SeasonSummary = {
   note: string; // data-source disclosure
   caveat: string; // weather-vs-crowds honesty disclaimer
 };
+// Same Approach-B idea applied to FLIGHTS — but this is the FIRST tool that needs an API KEY
+// (Duffel). When a Duffel key is configured the agent can call find_flights, and the route
+// attaches the cheapest round-trip the tool found here. Like every other grounded value, this is
+// OURS (the tool's result), not a price the model asserted. When NO key is set the tool isn't
+// even offered, so this stays undefined and the app degrades cleanly to its keyless feature set —
+// that graceful degradation IS the point of the milestone. In Duffel TEST mode the fares are
+// SYNTHETIC (a fictional test airline), so `testMode` drives a loud "illustrative, not a real
+// fare" disclaimer in the UI — the same honest-about-limits stance the season tool takes on
+// crowds. Self-contained (no server-only import) so it's safe in the client bundle.
+export type FlightLeg = {
+  fromCity: string;
+  fromCode: string; // IATA airport/city code Duffel actually searched
+  toCity: string;
+  toCode: string;
+  date: string; // YYYY-MM-DD representative departure date for this leg
+  stops: number | null; // 0 = nonstop; null if Duffel didn't break out segments
+};
+export type FlightSummary = {
+  source: "duffel"; // only ever attached when a real Duffel search ran
+  testMode: boolean; // true → synthetic test data → show the disclaimer
+  origin: string; // the departure city as the traveler phrased it
+  legs: FlightLeg[]; // [outbound] or [outbound, return]
+  totalAmount: number | null; // cheapest combined price, in `currency`
+  currency: string | null; // ISO 4217 from Duffel (e.g. "GBP", "USD")
+  airline: string | null; // the cheapest offer's airline (e.g. "Duffel Airways" in test mode)
+  cabin: string; // "economy" in v1
+  note: string; // price basis + the test-mode disclaimer
+};
 
 export type VerifiedCity = Omit<City, "days"> & {
   days: VerifiedDay[];
@@ -138,4 +166,5 @@ export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
   cities: VerifiedCity[];
   budget?: BudgetSummary;
   season?: SeasonSummary;
+  flights?: FlightSummary;
 };

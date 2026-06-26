@@ -11,7 +11,9 @@ route and **grounds it in real data with four keyless tools** — it verifies th
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
 Wikivoyage), and grounds the **timing** in real climate normals (Open-Meteo) — all in a single
-agent loop, streaming live progress and marking each activity confirmed-real in the UI.
+agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
+optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
+one that degrades gracefully to nothing when no key is set.
 
 After the plan lands you can **refine it in plain language** — *"swap Coimbra for Braga",
 "make day 2 lighter", "add a city"* — and get back one revised, fully re-grounded plan
@@ -33,17 +35,28 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
    npm run dev
    ```
    Open http://localhost:3000 , type a brief (or click a sample), hit **Plan my trip**.
+4. **(Optional) Enable flight search.** Add a free Duffel **test** token to `.env.local` to turn on
+   the `find_flights` tool; without it everything else works unchanged (there's just no flight
+   block):
+   ```
+   DUFFEL_API_KEY=duffel_test_...
+   ```
+   Get one with no credit card at https://app.duffel.com/join → Developers → Access tokens.
+   Heads-up: **test-mode fares are synthetic** (a sandbox airline) and shown with a "test data"
+   badge — they prove the integration, not real prices. A live token returns real fares.
 
 ## How it works
 
 - **`app/page.tsx`** — the UI: one textarea, an optional clarifying-questions card, a
   live progress indicator (drafting → verifying *N/M* → routing *N/M cities* → pricing *N/M
-  cities* → timing *N/M cities* → finalizing), and the rendered itinerary with a **✓ real** badge
+  cities* → timing *N/M cities* → flights → finalizing), and the rendered itinerary with a **✓ real** badge
   on each verified place, a **grounded budget block** (trip total + per-day + where-to-save
   flags), a per-city **cost chip** (cheap/moderate/pricey/expensive · ~$/day, with real Wikivoyage
   example prices on hover), and a **"When to go" block** with a per-city **12-month weather strip**
   (each month coloured peak/shoulder/off-season, the trip's target month ringed, hover for that
-  month's detail) plus a target-month verdict. It reads the plan route's streamed events with a
+  month's detail) plus a target-month verdict, and — when a Duffel key is configured — a **flights
+  block** with the cheapest round-trip fare (badged "test data" for synthetic test-mode fares). It
+  reads the plan route's streamed events with a
   `fetch` + `ReadableStream` reader. Below a finished plan, a **refine composer** (quick chips + a
   free-text box) sends a change back through the same stream and repaints the revised plan in
   place. A footer credits the keyless data sources (incl. Open-Meteo, CC BY 4.0).
@@ -54,10 +67,11 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
 - **`app/api/plan/route.ts`** — `POST /api/plan` takes `{ brief, clarifications?, refine? }`
   and runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
   *forced* to verify its named places first (`verify_places`); then it's offered the optional
-  grounding tools it hasn't spent yet — `check_route` (multi-city only), `estimate_costs`, and
-  `best_time_to_go` — alongside `emit`, picking one per turn until none remain; finally it is
-  *forced* to emit the itinerary. The verification verdict, the grounded budget **and** the
-  grounded seasonality are attached on the server before it streams back. When `refine` is present
+  grounding tools it hasn't spent yet — `check_route` (multi-city only), `estimate_costs`,
+  `best_time_to_go`, and (only when a Duffel key is set) `find_flights` — alongside `emit`, picking
+  one per turn until none remain; finally it is *forced* to emit the itinerary. The verification
+  verdict, the grounded budget, the grounded seasonality **and** the grounded flights are attached
+  on the server before it streams back. When `refine` is present
   it carries the latest plan plus a change; the route strips its own annotations off that plan,
   seeds it (and the change) into the conversation, and runs the **same loop** — so the revision is
   re-verified, re-routed if its cities changed, and re-priced / re-timed if its cities or nights
@@ -109,17 +123,30 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   process-lifetime cache (normals barely change) and graceful degradation to "no data" on any
   error. The thresholds are documented, tunable heuristics. It grounds **weather** only — there's
   no keyless source for tourist crowds — and says so in a caveat.
+- **`lib/flights.ts`** — executes the `find_flights` tool, the **first tool that needs an API key**
+  (Duffel). It resolves each city name to an IATA code via Duffel's own Places endpoint (no
+  hardcoded map), then makes ONE round-trip offer request (two slices: out + return) with raw
+  `fetch` and reads back the cheapest economy fare. The whole tool branches on one env check: with
+  **no `DUFFEL_API_KEY`** it's never offered and returns a typed "unavailable" result (degradation
+  is a value, not a thrown error); with a **Duffel TEST key** it makes real API calls but returns
+  *synthetic* fares, flagged `testMode` so the UI shows a "test data" disclaimer; with a **live
+  key** the same flow returns real fares. Origin is required (inferred from the brief — no default
+  departure city), the date is a representative mid-month proxy, and like every other tool the price
+  shown is server-attached, never the model's claim.
 - **`lib/schema.ts`** — the itinerary shape, defined once as a Zod schema. It's the
   contract between the model and the UI. The same Zod schema is converted to JSON Schema
   (Zod 4's native `z.toJSONSchema`) and handed to Claude as the **forced** `emit_itinerary`
   tool — the reliable way to get structured JSON back. The response is validated with the
   same Zod schema before it reaches the UI. Enriched `Verified*` types add the per-activity
-  verdict, and self-contained `BudgetSummary` / `CityCostSummary` / `SeasonSummary` /
-  `MonthSeason` types carry the server-attached, grounded budget and seasonality (kept
-  import-free so the client bundle never pulls in the cost data, climate fetch, or scoring logic).
+  verdict, and self-contained `BudgetSummary` / `CityCostSummary` / `SeasonSummary` / `MonthSeason`
+  / `FlightSummary` types carry the server-attached, grounded budget, seasonality and flights (kept
+  import-free so the client bundle never pulls in the cost data, climate fetch, scoring logic, or
+  Duffel client).
 - **`lib/prompt.ts`** — two system prompts: the decisive-travel-agent personality for the
-  planner (now describing all four grounding tools and when to spend the optional ones), and
-  a tight "ask only if it matters" prompt for the clarify step.
+  planner (describing the four keyless grounding tools and when to spend the optional ones), plus a
+  `FLIGHTS_CLAUSE` appended to it **only when a Duffel key is configured** (capability-conditional
+  prompting — the planner hears about `find_flights` exactly when it can use it); and a tight
+  "ask only if it matters" prompt for the clarify step.
 
 ## The agent loop (the concept worth understanding)
 
@@ -135,11 +162,12 @@ turn 2…: Claude is offered the optional tools it hasn't spent + emit, picks ON
            check_route([cities])      # multi-city only — geocode + leg distances + flags
            estimate_costs([cities])   # cost tier + daily budget + Wikivoyage price anchors
            best_time_to_go([cities])  # 12-month climate normals -> peak/shoulder/off + best window
+           find_flights([...])        # ONLY if a Duffel key is set — cheapest round-trip fare
            emit_itinerary({...})      # done
-         (route/cost/timing are each gated to one use; cost & timing wait until the route is
-          settled, so they see the final city set)
+         (route/cost/timing/flights each gated to one use; cost, timing & flights wait until the
+          route is settled, so they see the final city set)
 turn N:  Claude -> tool_use: emit_itinerary({...})    # FORCED once nothing optional remains
-         attach our verdicts + grounded budget + grounded seasonality -> render badges
+         attach our verdicts + grounded budget + seasonality + flights -> render badges
 ```
 
 Three things make this sturdy:
@@ -149,21 +177,23 @@ Three things make this sturdy:
   it never grounded — grounding is **structural**, not a polite request in the prompt.
 - **The optional tools are the agent's choice, gated to where they matter.** After
   verification, the model is offered the optional grounding tools it hasn't used yet —
-  `check_route` (multi-city only), `estimate_costs`, and `best_time_to_go` — alongside `emit`,
-  and must pick exactly one (`tool_choice: {type:"any", disable_parallel_tool_use:true}`). Each is
-  gated to a single use, so the loop can't spin: at most one route + one cost + one timing turn
-  before emit. Cost and timing are only offered once the route is settled, so they compute against
-  the final city set. A single-city trip is never offered `check_route`; a trip with no budget or
-  timing angle just won't be steered to those tools. This adds the new tools **without** weakening
-  the place-grounding guarantee: `verify_places` stays the lone forced tool on turn 1 regardless.
+  `check_route` (multi-city only), `estimate_costs`, `best_time_to_go`, and `find_flights` (only
+  when a Duffel key is configured) — alongside `emit`, and must pick exactly one
+  (`tool_choice: {type:"any", disable_parallel_tool_use:true}`). Each is gated to a single use, so
+  the loop can't spin: at most one route + one cost + one timing + one flights turn before emit.
+  Cost, timing and flights are only offered once the route is settled, so they compute against the
+  final city set. A single-city trip is never offered `check_route`; a trip with no budget or timing
+  angle just won't be steered to those tools; and with no Duffel key `find_flights` simply never
+  appears. This adds the new tools **without** weakening the place-grounding guarantee:
+  `verify_places` stays the lone forced tool on turn 1 regardless.
 - **Streaming.** Each model call uses `client.messages.stream(...).finalMessage()` (no
   HTTP timeout on the large emit turn, room for `max_tokens` up to 64k on long trips), and
   the route streams phase + per-place + per-city progress events the whole way. A heartbeat
   keeps the connection visibly alive during the silent model turns.
 
-The loop is bounded (`MAX_TURNS = 7`, worst legitimate path verify-retry → verify → route →
-cost → timing → emit) on purpose: every turn is a full, slow model call, and a free-form loop
-ballooned to ~100s in testing.
+The loop is bounded (`MAX_TURNS = 8`, worst legitimate path verify-retry → verify → route →
+cost → timing → flights → emit) on purpose: every turn is a full, slow model call, and a free-form
+loop ballooned to ~100s in testing.
 
 ## Grounding the route (why a second tool)
 
@@ -227,6 +257,33 @@ heat, 37 °C") so the agent can warn the traveler and suggest a better window, o
 server-attached** (`annotateItinerary`, with the target-month verdict recomputed from the final
 cities), never the model's claim. It grounds **weather comfort only** — there's no keyless source
 for tourist crowds, so a caveat says a weather-mild month can still be the busiest.
+
+## Grounding the flights (the first keyed tool)
+
+Every tool so far is keyless. Real flight prices aren't: there's no reliable free, keyless source
+(the budget tool says as much and excludes flights on purpose). So `find_flights` is the project's
+**first tool that needs an API key** — and the point is as much the *pattern* as the prices:
+**graceful degradation around an optional capability.**
+
+- **No key → the app is unchanged.** When `DUFFEL_API_KEY` is unset, the loop never offers the
+  tool and the flights clause is dropped from the system prompt, so the model can't even try. The
+  five keyless tools carry the whole plan exactly as before — no error, no empty block. Degradation
+  is a *first-class return value* (`{ source: "unavailable", reason }`), never a thrown exception.
+- **A free Duffel TEST key → the integration lights up, honestly labelled.** Duffel's test mode is
+  free (no card), but its fares are **synthetic** — a sandbox airline, not real prices (the docs say
+  so outright). The tool flags this `testMode`, and the UI shows a loud "test data" badge and a
+  disclaimer. That's the same honest-about-limits stance the season tool takes on crowds: show the
+  real thing the tool *can* ground, and be blunt about what it can't.
+- **A live key → real fares, same code.** A production token returns real fares with no disclaimer;
+  nothing else changes.
+
+Mechanically (raw `fetch`, no SDK, so the HTTP stays visible): resolve each city to an IATA code via
+Duffel's own Places endpoint, then one round-trip offer request (two slices, out + return) sorted to
+the cheapest economy offer. Two wrinkles that earlier tools never had: a flight needs an **origin**
+(inferred from the brief — if you don't say where you're leaving from, it skips flights rather than
+guess), and an exact **date** (we use a representative mid-month proxy from the travel month, so the
+fare is a *sample for that month*, not a quote for your trip). Like every other tool, the displayed
+fare is **server-attached** (`annotateItinerary`), never the model's claim.
 
 ## Clarifying questions (Approach C)
 
@@ -294,6 +351,12 @@ small decision, not the planning).
   holidays, or festivals — a month that's mild by weather can still be the busiest of the year. The
   comfort labels are tunable heuristics for a general traveler, and the normals are a 5-year recent
   average, not a guarantee for any one trip. Treat the labels as a strong steer, not a forecast.
+- **Flights are off by default, and test fares are synthetic.** `find_flights` only runs when a
+  Duffel API key is set; otherwise there's simply no flight block. With a free Duffel *test* key the
+  fares are **synthetic sandbox data** (a fake airline), shown with a "test data" badge — they prove
+  the integration, not real prices. Real fares need a live Duffel token. Either way it prices a
+  single representative mid-month round-trip (one origin, economy, 1 adult) — a planning ballpark,
+  not your actual itinerary's fares.
 - **Long trips stream, but the function still has a wall-clock cap.** Streaming means the
   browser sees live progress instead of a blank spinner and never times out on its own.
   But the route still has to *finish* within the server's function cap — on Vercel's free
@@ -324,5 +387,9 @@ small decision, not the planning).
    season per month, a best-window recommendation, and a verdict on the traveler's chosen month.
    Shoulder season is the biggest free lever on price and crowds, so it's the natural next deals
    signal after budget.
-8. Then the rest of the all-in-one vision: optional live flight search (Duffel sandbox, keyed)
-   and eventually booking — each a new tool on the same agent.
+8. ✅ **Flight search — done.** `find_flights` (Duffel) is the first **keyed** tool — optional, and
+   degrading gracefully to nothing when no key is set. Free Duffel test fares are synthetic (badged
+   "test data"); a live key returns real fares. The pattern it teaches is the keyed-tool +
+   graceful-degradation shape the all-in-one vision needs.
+9. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
+   agent.

@@ -5,16 +5,18 @@ import {
   itinerarySchema,
   type BudgetSummary,
   type CitySeasonSummary,
+  type FlightSummary,
   type Itinerary,
   type SeasonSummary,
   type VerifiedItinerary,
   type VerifyStatus,
 } from "@/lib/schema";
-import { SYSTEM_PROMPT } from "@/lib/prompt";
+import { SYSTEM_PROMPT, FLIGHTS_CLAUSE } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
 import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
+import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
 
 // The Anthropic SDK needs the Node runtime (not edge).
 export const runtime = "nodejs";
@@ -40,13 +42,13 @@ const MAX_REFINE_ITINERARY_CHARS = 200_000;
 const MAX_BODY_CHARS = 1_000_000;
 // Backstop on agent-loop iterations. Happy path: 2 model turns for a single-city trip with no
 // budget/timing angle (verify, then a forced emit). Each optional grounding tool the agent
-// chooses to use adds one turn: estimate_costs and best_time_to_go (single-city), or
-// check_route + estimate_costs + best_time_to_go (multi-city), each gated to a single use. So
-// the longest legitimate path is verify-retry -> verify -> check_route -> estimate_costs ->
-// best_time_to_go -> emit = 6 turns; 7 leaves a turn of headroom. Each optional tool is gated
-// to one use, so the loop can't spin. Guards against anything unexpected so a request can't run
-// forever.
-const MAX_TURNS = 7;
+// chooses to use adds one turn: estimate_costs, best_time_to_go and (when a Duffel key is set)
+// find_flights for a single-city trip, or check_route + those three for multi-city — each gated to
+// a single use. So the longest legitimate path is verify-retry -> verify -> check_route ->
+// estimate_costs -> best_time_to_go -> find_flights -> emit = 7 turns; 8 leaves a turn of
+// headroom. Each optional tool is gated to one use, so the loop can't spin. Guards against
+// anything unexpected so a request can't run forever.
+const MAX_TURNS = 8;
 // How many times the model may call verify_places with nothing checkable before
 // we give up with a clear error (instead of silently burning the turn budget).
 const EMPTY_VERIFY_RETRIES = 1;
@@ -201,6 +203,50 @@ const BEST_TIME_TOOL: Anthropic.Tool = {
   } as Anthropic.Tool.InputSchema,
 };
 
+// The first tool that needs an API KEY (Duffel). The loop only offers it when DUFFEL_API_KEY is
+// set; without a key the app runs its keyless 5-tool self. origin is required — there's no sane
+// default departure city — so when the brief gives none the prompt tells the model to skip flights
+// rather than guess.
+const FIND_FLIGHTS_TOOL: Anthropic.Tool = {
+  name: "find_flights",
+  description:
+    "Price the FLIGHTS for the trip — the round-trip airfare that estimate_costs deliberately leaves out. Only useful when you know where the traveler DEPARTS FROM. Pass their origin (home city or IATA code), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country; omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. Returns the cheapest economy round-trip fare from a live flight-search API. Some results are flagged as TEST DATA (synthetic prices from a test airline) — when so, treat the fare as illustrative only, never a real quote. Call once, after the cities and month are settled.",
+  input_schema: {
+    type: "object",
+    properties: {
+      origin: {
+        type: "string",
+        description:
+          'The traveler\'s departure city or IATA code (e.g. "London" or "LON"). Required — infer it from the brief; if the brief names no home city, do NOT call this tool.',
+      },
+      arriveCity: {
+        type: "string",
+        description: "The first city of the trip — the one they fly into.",
+      },
+      arriveCountry: {
+        type: "string",
+        description: "Country of the arrival city (helps locate the airport).",
+      },
+      departCity: {
+        type: "string",
+        description:
+          "The last city of the trip — the one they fly home from. Omit for a single-base trip (defaults to arriveCity).",
+      },
+      departCountry: { type: "string", description: "Country of the fly-home city." },
+      month: {
+        type: "string",
+        description:
+          'The travel month as YYYY-MM (e.g. "2026-09"). Use the actual future month of travel.',
+      },
+      nights: {
+        type: "number",
+        description: "Total nights of the trip, used to set the return date.",
+      },
+    },
+    required: ["origin", "arriveCity"],
+  } as Anthropic.Tool.InputSchema,
+};
+
 const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
   name: "emit_itinerary",
   description:
@@ -215,7 +261,7 @@ const EMIT_ITINERARY_TOOL: Anthropic.Tool = {
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -264,6 +310,9 @@ function annotateItinerary(
   // The last best_time_to_go result, if the agent ran one. Same deal: the season labels the UI
   // shows are the tool's, not the model's. null when the agent didn't assess timing.
   season: SeasonSummary | null,
+  // The last find_flights result, if the agent ran one. We attach only a successful Duffel search;
+  // an "unavailable" result (no key/origin/offers) attaches nothing, leaving the keyless app shape.
+  flights: FlightResult | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -356,10 +405,17 @@ function annotateItinerary(
     };
   }
 
+  // Attach flights only when a real Duffel search produced a priced result. An "unavailable"
+  // result (no key, no origin, no offers) attaches nothing — the plan looks exactly like the
+  // keyless app, which is the whole point of the graceful-degradation gate.
+  const flightsOut: FlightSummary | undefined =
+    flights && flights.source === "duffel" ? flights : undefined;
+
   return {
     ...itinerary,
     ...(budget ? { budget } : {}),
     ...(seasonOut ? { season: seasonOut } : {}),
+    ...(flightsOut ? { flights: flightsOut } : {}),
     cities,
   };
 }
@@ -436,6 +492,14 @@ export async function POST(req: Request) {
     );
   }
 
+  // The keyed-tool gate. find_flights is the ONLY tool that needs an API key (Duffel). When it's
+  // absent we drop the flights clause from the system prompt AND never offer the tool, so the app
+  // degrades cleanly to its keyless five-tool self — no errors, no dead UI, nothing for the model
+  // to attempt. Present a key (a free Duffel test token) and the capability simply appears.
+  const duffelKey = process.env.DUFFEL_API_KEY;
+  const flightsEnabled = !!duffelKey;
+  const systemPrompt = SYSTEM_PROMPT + (flightsEnabled ? FLIGHTS_CLAUSE : "");
+
   const client = new Anthropic();
   const encoder = new TextEncoder();
 
@@ -503,10 +567,14 @@ export async function POST(req: Request) {
       let routedOnce = false; // has the model used its one check_route round?
       let costedOnce = false; // has the model used its one estimate_costs round?
       let seasonedOnce = false; // has the model used its one best_time_to_go round?
+      let flightedOnce = false; // has the model used its one find_flights round?
       // The grounded budget from the last estimate_costs call, attached to the final plan.
       let costEstimate: CostEstimate | null = null;
       // The grounded seasonality from the last best_time_to_go call, attached to the final plan.
       let seasonEstimate: SeasonSummary | null = null;
+      // The grounded flights from the last find_flights call (attached only when it's a successful
+      // Duffel search; an "unavailable" result attaches nothing but still informs the model).
+      let flightEstimate: FlightResult | null = null;
       // Does the plan span 2+ cities? Gates the check_route turn. Seed it from the prior
       // plan on a refine so a multi-city refine still gets a route check even if the model's
       // verify batch happens to under-represent the cities; the post-verify recompute below
@@ -523,7 +591,7 @@ export async function POST(req: Request) {
           // a multi-city trip gets ONE optional check_route turn (the model chooses
           // route-or-emit), then emit is forced. Single-city trips skip straight to a
           // forced emit: there's no route to check.
-          let phase: "drafting" | "routing" | "pricing" | "timing" | "finalizing";
+          let phase: "drafting" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
           let toolsForTurn: Anthropic.Tool[];
           let toolChoice: Anthropic.ToolChoice;
           if (!verifiedOnce) {
@@ -537,28 +605,43 @@ export async function POST(req: Request) {
             toolChoice = { type: "tool", name: "verify_places", disable_parallel_tool_use: true };
           } else {
             // Places are grounded. Offer the OPTIONAL grounding tools the agent hasn't spent
-            // yet — check_route (multi-city only), estimate_costs and best_time_to_go —
-            // alongside emit, and let the model choose (the prompt steers when each earns its
-            // turn). Each is gated to a single use, so the loop can't spin: at most one route +
-            // one cost + one timing turn before emit. disable_parallel_tool_use keeps it to
-            // exactly one tool_use per response, the same invariant every other turn relies on.
-            // When no optional tool is left, force the final emit. (verify_places stays the sole
-            // forced tool on turn 0, so place grounding is still structural — route/cost/timing
-            // are the agent's call.)
+            // yet — check_route (multi-city only), estimate_costs, best_time_to_go and (only when a
+            // Duffel key is set) find_flights — alongside emit, and let the model choose (the
+            // prompt steers when each earns its turn). Each is gated to a single use, so the loop
+            // can't spin: at most one route + one cost + one timing + one flights turn before emit.
+            // disable_parallel_tool_use keeps it to exactly one tool_use per response, the same
+            // invariant every other turn relies on. When no optional tool is left, force the final
+            // emit. (verify_places stays the sole forced tool on turn 0, so place grounding is
+            // still structural — route/cost/timing/flights are the agent's call.)
             const optional: Anthropic.Tool[] = [];
             if (multiCity && !routedOnce) optional.push(CHECK_ROUTE_TOOL);
-            // Offer cost and timing only once the route is settled (or there's no route to
-            // settle), so they're computed against the FINAL city set — not one check_route may
+            // Offer cost, timing and flights only once the route is settled (or there's no route
+            // to settle), so they're computed against the FINAL city set — no check_route can
             // still reorder or drop. Enforces the prompt's "ground once the cities are settled"
-            // at the loop level instead of trusting the model to sequence it.
+            // at the loop level instead of trusting the model to sequence it. find_flights is also
+            // gated on a Duffel key being configured — the keyed-tool gate; no key, never offered.
             if (!costedOnce && (!multiCity || routedOnce)) optional.push(ESTIMATE_COSTS_TOOL);
             if (!seasonedOnce && (!multiCity || routedOnce)) optional.push(BEST_TIME_TOOL);
+            // find_flights goes last — only AFTER best_time_to_go has run (seasonedOnce), so the
+            // fare is priced for the FINAL travel month, never one a later timing call would revise.
+            // A trip worth pricing flights for names a month or dates, which the prompt routes
+            // through best_time_to_go first, so flights still gets its turn; a dateless trip (where a
+            // fare is barely meaningful) just won't trigger it. seasonedOnce also implies the route
+            // was settled, so this inherits the cities-settled guarantee too.
+            if (flightsEnabled && !flightedOnce && seasonedOnce) optional.push(FIND_FLIGHTS_TOOL);
             if (optional.length > 0) {
               // Pre-decision label: name the work most likely to run next so the UI shows a
               // sensible phase before the model picks. Routing comes first on a multi-city trip;
-              // otherwise cost, then timing. The precise per-tool status fires when the chosen
-              // tool actually runs (or finalizing if it emits instead).
-              phase = multiCity && !routedOnce ? "routing" : !costedOnce ? "pricing" : "timing";
+              // otherwise cost, then timing, then flights. The precise per-tool status fires when
+              // the chosen tool actually runs (or finalizing if it emits instead).
+              phase =
+                multiCity && !routedOnce
+                  ? "routing"
+                  : !costedOnce
+                    ? "pricing"
+                    : !seasonedOnce
+                      ? "timing"
+                      : "flights";
               toolsForTurn = [...optional, EMIT_ITINERARY_TOOL];
               toolChoice = { type: "any", disable_parallel_tool_use: true };
             } else {
@@ -587,7 +670,7 @@ export async function POST(req: Request) {
                 {
                   model: MODEL,
                   max_tokens: phase === "drafting" ? 16000 : 64000,
-                  system: SYSTEM_PROMPT,
+                  system: systemPrompt,
                   tools: toolsForTurn,
                   tool_choice: toolChoice,
                   messages,
@@ -644,7 +727,13 @@ export async function POST(req: Request) {
             send({ type: "status", phase: "finalizing" });
             send({
               type: "itinerary",
-              itinerary: annotateItinerary(itinerary, verifyCache, costEstimate, seasonEstimate),
+              itinerary: annotateItinerary(
+                itinerary,
+                verifyCache,
+                costEstimate,
+                seasonEstimate,
+                flightEstimate,
+              ),
             });
             return;
           }
@@ -856,6 +945,69 @@ export async function POST(req: Request) {
             });
             seasonedOnce = true;
             continue; // back to the top — next turn the model prices/emits
+          }
+
+          if (toolUse.name === "find_flights") {
+            const input = toolUse.input as {
+              origin?: unknown;
+              arriveCity?: unknown;
+              arriveCountry?: unknown;
+              departCity?: unknown;
+              departCountry?: unknown;
+              month?: unknown;
+              nights?: unknown;
+            };
+            const str = (v: unknown) =>
+              typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+            const flightInput = {
+              origin: str(input.origin) ?? "",
+              arriveCity: str(input.arriveCity) ?? "",
+              arriveCountry: str(input.arriveCountry),
+              departCity: str(input.departCity),
+              departCountry: str(input.departCountry),
+              month: str(input.month) ?? null,
+              nights:
+                typeof input.nights === "number" && Number.isFinite(input.nights)
+                  ? input.nights
+                  : undefined,
+            };
+
+            send({ type: "status", phase: "flights" });
+            // Unlike the other tools (which stream per-city progress every ~1s), the Duffel
+            // offer-request POST is one synchronous call that can hold for ~20s+ with no
+            // intermediate event. Heartbeat the phase so the client's idle-abort timer can't trip
+            // during that silent window.
+            const flightHeartbeat = setInterval(
+              () => send({ type: "status", phase: "flights" }),
+              8000,
+            );
+            let result: FlightResult;
+            try {
+              result = await findFlights(
+                flightInput,
+                duffelKey,
+                (label) => send({ type: "status", phase: "flights", name: label }),
+                req.signal,
+              );
+            } finally {
+              clearInterval(flightHeartbeat);
+            }
+            // Attach only a real priced result to the plan (handled in annotateItinerary); an
+            // "unavailable" result still goes back to the model so it won't claim a fare, but it
+            // adds no flight block — the graceful-degradation path.
+            flightEstimate = result;
+            messages.push({
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(flightModelView(result)),
+                },
+              ],
+            });
+            flightedOnce = true;
+            continue; // back to the top — next turn the model emits
           }
 
           // Unknown tool name — bail rather than loop forever.
