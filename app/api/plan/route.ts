@@ -11,7 +11,7 @@ import {
   type VerifiedItinerary,
   type VerifyStatus,
 } from "@/lib/schema";
-import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, currencyClause } from "@/lib/prompt";
+import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, currencyClause } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
@@ -49,6 +49,8 @@ const MAX_BODY_CHARS = 1_000_000;
 // estimate_costs -> best_time_to_go -> find_flights -> emit = 7 turns; 8 leaves a turn of
 // headroom. Each optional tool is gated to one use, so the loop can't spin. Guards against
 // anything unexpected so a request can't run forever.
+// When the traveler gives an explicit origin, emit is withheld until find_flights runs — but that
+// just FILLS the already-budgeted flights turn rather than adding one, so this bound is unchanged.
 const MAX_TURNS = 8;
 // How many times the model may call verify_places with nothing checkable before
 // we give up with a clear error (instead of silently burning the turn budget).
@@ -293,6 +295,27 @@ function coerceArray(value: unknown): unknown[] {
   return [];
 }
 
+// The traveler's explicit departure city from the "Flying from?" field. It's the only user input
+// that flows toward both the model's context AND an outbound API (Duffel), so we sanitize it
+// server-side (the client maxLength is UX only): strip control characters — the prompt-injection
+// vector, e.g. a stray newline that fakes a fresh instruction block — collapse whitespace, and
+// hard-cap the length (a city/airport name never needs 120 chars). The cleaned value rides in the
+// USER turn, never the system prompt, so this is defense-in-depth, not the sole boundary.
+function sanitizeOrigin(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const cleaned = value
+    // Strip C0/C1 control chars AND Unicode format chars (zero-width spaces, bidi overrides) — the
+    // prompt-injection vector and the invisible-input vector both — then collapse whitespace and cap.
+    .replace(/[\x00-\x1f\x7f-\x9f\p{Cf}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  // A real city/airport name carries at least one letter. Rejecting letter-less input stops an
+  // invisible-only or punctuation-only origin from switching on the whole flights machinery (emit
+  // withheld, ORIGIN_CLAUSE added, a Duffel search) with nothing real to actually search for.
+  return /\p{L}/u.test(cleaned) ? cleaned : "";
+}
+
 // Attach our verification verdicts to the finished plan. The truth comes from what
 // our tool actually found, not from anything the model claims about its own places.
 //
@@ -445,6 +468,7 @@ export async function POST(req: Request) {
   }
 
   let brief = "";
+  let origin = "";
   let clarifications: Array<{ prompt: string; answer: string }> = [];
   // A refine request carries the latest plan plus a single change to apply. We re-ground it
   // by running the SAME loop (forced verify → optional check_route → forced emit), so the
@@ -459,6 +483,9 @@ export async function POST(req: Request) {
     }
     const body = JSON.parse(raw);
     brief = typeof body?.brief === "string" ? body.brief.trim() : "";
+    // The explicit departure city (from the "Flying from?" field). Sanitized now so it's clean
+    // wherever it's used; only acted on when flights are enabled (the keyed-tool gate, below).
+    origin = sanitizeOrigin(body?.origin);
     if (Array.isArray(body?.clarifications)) {
       clarifications = (body.clarifications as unknown[])
         .map((c) => (c && typeof c === "object" ? (c as Record<string, unknown>) : null))
@@ -518,9 +545,17 @@ export async function POST(req: Request) {
   // rate — no extra model turn, since an exchange rate is a fact, not a decision. The clause is only
   // added when home isn't USD; when it is, there's nothing to convert and the prompt is unchanged.
   const HOME = homeCurrency();
+  // The traveler's explicit departure city, acted on only when flights are actually enabled. The
+  // clause added here is generic, server-controlled text (see ORIGIN_CLAUSE); the value itself rides
+  // in the user turn (appended to the brief below), keeping raw user input out of the high-trust
+  // system prompt. hasOrigin also makes flights a REQUIRED step in the loop: emit is withheld until
+  // find_flights has run, so an explicit origin reliably lights up the fare instead of depending on
+  // the model choosing to price it.
+  const hasOrigin = flightsEnabled && origin.length > 0;
   const systemPrompt =
     SYSTEM_PROMPT +
     (flightsEnabled ? FLIGHTS_CLAUSE : "") +
+    (hasOrigin ? ORIGIN_CLAUSE : "") +
     (HOME !== "USD" ? currencyClause(HOME) : "");
 
   const client = new Anthropic();
@@ -552,7 +587,12 @@ export async function POST(req: Request) {
       // request. Turn 1 the model verifies places (we run the tool, feed results back);
       // a multi-city trip then gets a turn to check the route; the last turn we force it
       // to emit the final itinerary.
-      const messages: Anthropic.MessageParam[] = [{ role: "user", content: brief }];
+      // Append the explicit origin to the brief as a labeled line in the USER turn (not the system
+      // prompt). The model reads it for prose and to pick its first/last cities; the find_flights
+      // handler overrides the tool's origin arg with this same server-held value, so the actual
+      // search is grounded in it regardless of what the model echoes.
+      const briefForModel = hasOrigin ? `${brief}\n\nFlying from: ${origin}` : brief;
+      const messages: Anthropic.MessageParam[] = [{ role: "user", content: briefForModel }];
       if (clarifications.length > 0) {
         // Replay the clarifying exchange as real prior turns so the planner conditions on
         // it. This is the multi-turn state (Approach C): the agent "remembers" what it
@@ -665,7 +705,14 @@ export async function POST(req: Request) {
                     : !seasonedOnce
                       ? "timing"
                       : "flights";
-              toolsForTurn = [...optional, EMIT_ITINERARY_TOOL];
+              // When the traveler named an explicit departure city, pricing their flights is a
+              // REQUIRED step (like verify_places), so withhold emit until find_flights has run —
+              // the model can't finish without it. The gates above still enforce ORDER (route ->
+              // timing -> flights), so this only removes the early exit: a grounding tool is always
+              // offered until flightedOnce, and find_flights' handler always sets flightedOnce (even
+              // on an "unavailable" result), after which emit returns. No reorder, no deadlock.
+              const owesFlights = flightsEnabled && hasOrigin && !flightedOnce;
+              toolsForTurn = owesFlights ? [...optional] : [...optional, EMIT_ITINERARY_TOOL];
               toolChoice = { type: "any", disable_parallel_tool_use: true };
             } else {
               phase = "finalizing";
@@ -1002,8 +1049,17 @@ export async function POST(req: Request) {
             };
             const str = (v: unknown) =>
               typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+            // Server-authoritative origin: when the traveler gave an explicit departure city, that
+            // sanitized value wins over whatever the model echoed in the tool call (never trust the
+            // model to faithfully reproduce user input). Falls back to the model's origin otherwise.
+            const modelOrigin = str(input.origin);
+            if (hasOrigin && modelOrigin && modelOrigin.toLowerCase() !== origin.toLowerCase()) {
+              console.warn(
+                `find_flights origin override: model sent "${modelOrigin}", using "${origin}".`,
+              );
+            }
             const flightInput = {
-              origin: str(input.origin) ?? "",
+              origin: (hasOrigin ? origin : modelOrigin) ?? "",
               arriveCity: str(input.arriveCity) ?? "",
               arriveCountry: str(input.arriveCountry),
               departCity: str(input.departCity),
