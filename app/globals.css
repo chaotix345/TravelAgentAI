@@ -382,6 +382,22 @@ button.link:hover {
   text-transform: capitalize;
 }
 
+/* The native (pre-conversion) figure shown quietly beside a converted headline amount. */
+.budget-native,
+.flights-native {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+/* Exchange-rate provenance line under a converted budget/fare — same muted note styling. */
+.fx-note {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .budget-flags {
   margin: 12px 0 0;
   padding: 0;

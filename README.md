@@ -13,7 +13,11 @@ distances along the route, grounds the **budget** in real cost data (World Bank 
 Wikivoyage), and grounds the **timing** in real climate normals (Open-Meteo) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
-one that degrades gracefully to nothing when no key is set.
+one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
+flight fare — is then shown in **your home currency** (default AUD, set `HOME_CURRENCY` to change),
+converted at a live **European Central Bank** reference rate (keyless, via Frankfurter), so a budget
+computed in USD and a fare Duffel happens to quote in another currency both land in the currency you
+actually think in.
 
 After the plan lands you can **refine it in plain language** — *"swap Coimbra for Braga",
 "make day 2 lighter", "add a city"* — and get back one revised, fully re-grounded plan
@@ -51,11 +55,14 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   live progress indicator (drafting → verifying *N/M* → routing *N/M cities* → pricing *N/M
   cities* → timing *N/M cities* → flights → finalizing), and the rendered itinerary with a **✓ real** badge
   on each verified place, a **grounded budget block** (trip total + per-day + where-to-save
-  flags), a per-city **cost chip** (cheap/moderate/pricey/expensive · ~$/day, with real Wikivoyage
+  flags, shown in your home currency with the native USD figure beside it), a per-city **cost chip**
+  (cheap/moderate/pricey/expensive · ~home-currency/day, with real Wikivoyage
   example prices on hover), and a **"When to go" block** with a per-city **12-month weather strip**
   (each month coloured peak/shoulder/off-season, the trip's target month ringed, hover for that
   month's detail) plus a target-month verdict, and — when a Duffel key is configured — a **flights
-  block** with the cheapest round-trip fare (badged "test data" for synthetic test-mode fares). It
+  block** with the cheapest round-trip fare (badged "test data" for synthetic test-mode fares, shown
+  in your home currency with Duffel's native quote beside it). Each converted figure carries a small
+  ECB-rate provenance line. It
   reads the plan route's streamed events with a
   `fetch` + `ReadableStream` reader. Below a finished plan, a **refine composer** (quick chips + a
   free-text box) sends a change back through the same stream and repaints the revised plan in
@@ -133,6 +140,16 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   key** the same flow returns real fares. Origin is required (inferred from the brief — no default
   departure city), the date is a representative mid-month proxy, and like every other tool the price
   shown is server-attached, never the model's claim.
+- **`lib/currency.ts`** — the cross-currency layer, and the **first grounding that isn't a tool the
+  model calls**. An exchange rate is a deterministic live fact, not a planning decision, so instead
+  of a model turn it's a pure server-side transform run *after* a tool returns: it fetches the
+  native→home rate from the keyless **Frankfurter** API (pure **ECB reference rates**), then
+  `applyFxToCost` / `applyFxToFlights` augment the budget and fare with home-currency figures
+  (rewriting the `$`-baked cost flags too). The home currency is a user setting (`HOME_CURRENCY`,
+  default AUD). Same discipline as the other sources: a same-currency identity short-circuit (no
+  fetch), a best-effort per-day rate cache, and graceful degradation — any FX failure or unsupported
+  currency just shows the native figure, never a broken plan. The converted figures are fed back
+  into the model's tool_result so its prose cites the home-currency amount too.
 - **`lib/schema.ts`** — the itinerary shape, defined once as a Zod schema. It's the
   contract between the model and the UI. The same Zod schema is converted to JSON Schema
   (Zod 4's native `z.toJSONSchema`) and handed to Claude as the **forced** `emit_itinerary`
@@ -391,5 +408,10 @@ small decision, not the planning).
    degrading gracefully to nothing when no key is set. Free Duffel test fares are synthetic (badged
    "test data"); a live key returns real fares. The pattern it teaches is the keyed-tool +
    graceful-degradation shape the all-in-one vision needs.
-9. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
-   agent.
+9. ✅ **Cross-currency display — done.** Budgets (USD) and Duffel fares (any currency) are converted
+   to your home currency (default AUD) at live **ECB** reference rates (keyless, via Frankfurter).
+   The lesson it teaches: the first grounding that *isn't* a model tool — an exchange rate is a fact,
+   not a decision, so it's a pure server-side transform run after the tool returns, fed back into the
+   model's prose so nothing shows `$` next to `£`.
+10. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
+    agent.
