@@ -7,6 +7,7 @@ import type {
   VerifiedActivity,
   VerifiedCity,
   BudgetSummary,
+  FlightSummary,
   SeasonSummary,
   CitySeasonSummary,
   SeasonLabel,
@@ -28,7 +29,7 @@ const REFINE_CHIPS = ["Make it broader", "Make days lighter", "More food", "More
 type PlanEvent =
   | {
       type: "status";
-      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "finalizing";
+      phase: "drafting" | "verifying" | "routing" | "pricing" | "timing" | "flights" | "finalizing";
       done?: number;
       total?: number;
       name?: string;
@@ -43,7 +44,8 @@ type Clarification = { prompt: string; answer: string };
 type Progress =
   | { phase: "drafting" | "finalizing" }
   | { phase: "verifying"; done: number; total: number }
-  | { phase: "routing" | "pricing" | "timing"; done: number; total: number; name?: string };
+  | { phase: "routing" | "pricing" | "timing"; done: number; total: number; name?: string }
+  | { phase: "flights"; name?: string };
 
 // What runPlan needs: the brief + clarifications context, and — for a concierge tweak — the
 // latest plan plus the change to apply. A refine reuses the ORIGINAL brief/clarifications so
@@ -213,6 +215,14 @@ export default function Home() {
                     ? prev
                     : { phase: ph, done: 0, total: 0 },
               );
+            } else if (evt.phase === "flights") {
+              // Flights has no per-city counts — just a label. Keep the last label across the
+              // heartbeats (which carry no name) so the line doesn't flicker back to bare.
+              const nm = evt.name;
+              setProgress((prev) => ({
+                phase: "flights",
+                name: nm ?? (prev && prev.phase === "flights" ? prev.name : undefined),
+              }));
             } else {
               setProgress({ phase: evt.phase });
             }
@@ -342,7 +352,12 @@ export default function Home() {
         <a href="https://open-meteo.com" target="_blank" rel="noreferrer noopener">
           Open-Meteo
         </a>{" "}
-        (CC BY 4.0). A planning aid, not a booking service.
+        (CC BY 4.0). Flight fares, when a{" "}
+        <a href="https://duffel.com" target="_blank" rel="noreferrer noopener">
+          Duffel
+        </a>{" "}
+        key is configured, come from its flight-search API — test-mode fares are illustrative, not
+        real quotes. A planning aid, not a booking service.
       </footer>
     </main>
   );
@@ -429,7 +444,9 @@ function ProgressView({ progress }: { progress: Progress | null }) {
                     progress.name ? ` · ${progress.name}` : ""
                   }`
                 : "Checking the best time to go…"
-              : "Finalizing your itinerary…";
+              : progress.phase === "flights"
+                ? `Pricing flights…${progress.name ? ` · ${progress.name}` : ""}`
+                : "Finalizing your itinerary…";
 
   const pct =
     (progress?.phase === "verifying" ||
@@ -464,6 +481,7 @@ function Plan({ itinerary }: { itinerary: VerifiedItinerary }) {
       </p>
 
       {itinerary.budget && <BudgetBlock budget={itinerary.budget} />}
+      {itinerary.flights && <FlightsBlock flights={itinerary.flights} />}
       {itinerary.season && <SeasonBlock season={itinerary.season} />}
 
       {itinerary.cities.map((city, i) => (
@@ -518,6 +536,66 @@ function BudgetBlock({ budget }: { budget: BudgetSummary }) {
         </ul>
       )}
       <p className="budget-note">{budget.note}</p>
+    </div>
+  );
+}
+
+const CURRENCY_SYMBOL: Record<string, string> = {
+  USD: "$", GBP: "£", EUR: "€", JPY: "¥", CAD: "C$", AUD: "A$", CHF: "CHF ", INR: "₹",
+};
+
+// The grounded flights, server-attached from the find_flights (Duffel) tool — the FIRST keyed
+// tool. Like the budget and season, the price shown is the tool's, not the model's. In Duffel TEST
+// mode the fares are synthetic, so we show a loud "test data" badge and the disclaimer in the
+// note; with a live key the same block reads "live fare". Renders only when the agent priced
+// flights, which only happens when a Duffel key is configured (the graceful-degradation gate).
+function FlightsBlock({ flights }: { flights: FlightSummary }) {
+  const code = flights.currency ?? "";
+  const money = (n: number) =>
+    `${CURRENCY_SYMBOL[code] ?? (code ? code + " " : "$")}${n.toLocaleString()}`;
+  const amount = flights.totalAmount != null ? money(flights.totalAmount) : "Fare estimate";
+
+  const legs = flights.legs;
+  // A symmetric there-and-back (same airports both ways) reads as "London ⇄ Lisbon"; an open-jaw
+  // (fly into one city, home from another) lists each leg.
+  const roundTrip =
+    legs.length === 2 &&
+    legs[0].fromCode === legs[1].toCode &&
+    legs[0].toCode === legs[1].fromCode;
+  const route =
+    legs.length === 0
+      ? ""
+      : roundTrip
+        ? `${legs[0].fromCity} ⇄ ${legs[0].toCity}`
+        : legs.map((l) => `${l.fromCity} → ${l.toCity}`).join(" · ");
+
+  return (
+    <div className="flights">
+      <div className="flights-head">
+        <span className="flights-amount">{amount}</span>
+        <span className="flights-sub">
+          round trip · per person{flights.airline ? ` · ${flights.airline}` : ""}
+        </span>
+        {flights.testMode ? (
+          <span
+            className="badge warn"
+            tabIndex={0}
+            title="Synthetic fares from Duffel's test environment — not a real, bookable price. Set a live Duffel key for real fares."
+          >
+            test data
+          </span>
+        ) : (
+          <span
+            className="badge ok"
+            tabIndex={0}
+            title="A live fare snapshot from Duffel — prices change, so treat it as a ballpark."
+          >
+            live fare
+          </span>
+        )}
+      </div>
+      {route && <p className="flights-route">{route}</p>}
+      <p className="flights-note">{flights.note}</p>
     </div>
   );
 }

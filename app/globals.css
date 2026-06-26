@@ -453,6 +453,46 @@ button.link:hover {
   border-color: #f3c2bb;
 }
 
+/* --- Flights (find_flights / Duffel — the first keyed tool) --- */
+.flights {
+  margin: 0 0 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.flights-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.flights-amount {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.flights-sub {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.flights-route {
+  margin: 10px 0 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.flights-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 .refine {
   margin-top: 32px;
   padding: 20px 18px 18px;

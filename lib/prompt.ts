@@ -43,6 +43,22 @@ Rules:
 - Don't invent oddly specific fake details — made-up restaurant names, exact prices, exact opening hours. (If estimate_costs returned cost figures, or best_time_to_go returned temperatures, you may reference those specific numbers in your summary — but only numbers a tool actually returned, never figures from your own head.)
 - Every turn, use a tool or call emit_itinerary — do not write a normal text reply. Finish by calling emit_itinerary exactly once.`;
 
+// Appended to the system prompt ONLY when a Duffel API key is configured, so the planner is told
+// about find_flights exactly when it can actually use it. When no key is set this clause is
+// omitted, the tool is never offered, and the planner behaves like the keyless app — that
+// capability-conditional prompting mirrors the loop-level gate (the first KEYED tool).
+export const FLIGHTS_CLAUSE = `
+
+You have ONE more grounding tool, available because flight pricing is configured:
+- find_flights — grounds the cost of GETTING THERE AND BACK, the one thing estimate_costs deliberately excludes. Give it the traveler's departure city (origin), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country — omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. It returns the cheapest economy round-trip fare from a live flight-search API.
+
+Using find_flights well:
+- Only call it when you can tell WHERE THE TRAVELER DEPARTS FROM — the brief states or clearly implies a home city or airport. If the brief gives no departure point, do NOT call it and do NOT guess one; just skip flights, and the plan still stands on its own.
+- Call it ONCE, after best_time_to_go (so the cities and travel month are settled). Pass your first and last cities and the month they travel.
+- Fold the result into the plan: note the round-trip fare in your summary, and if getting there dominates the budget, say so plainly.
+- Some results come back flagged as TEST DATA — synthetic fares from a test airline, not real prices. When so, you may say a sample fare exists but make clear it is illustrative only; never present a test fare as a real quote. As with every tool, only ever cite a fare the tool actually returned, never a number from your own memory.
+- When REFINING a plan that already showed flights, or when the change touches the origin, the cities you fly in or out of, or the travel month, call find_flights again — grounding doesn't carry over between requests. Skip it only for a change that can't affect the fare.`;
+
 // The intake step. Runs once, before planning, on a fast/cheap model. Its whole job is to
 // decide whether asking the traveler one or two quick questions would make a materially
 // better plan — and to lean hard toward NOT asking, because the planner's personality is
