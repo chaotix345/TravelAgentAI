@@ -14,7 +14,7 @@ import {
 } from "@/lib/schema";
 import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, currencyClause } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
-import { checkRoute } from "@/lib/route";
+import { checkRoute, buildRouteSummary, type StoredRouteMatrix } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
 import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
 import { assessHolidays, holidayModelView, recomputeHolidays } from "@/lib/holidays";
@@ -129,7 +129,7 @@ const VERIFY_PLACES_TOOL: Anthropic.Tool = {
 const CHECK_ROUTE_TOOL: Anthropic.Tool = {
   name: "check_route",
   description:
-    "Sanity-check the geography of a multi-city route. List your cities IN THE ORDER you plan to visit them. Returns the great-circle (straight-line) distance of each leg and the total, flags hops that are very long, and — if a clearly better ordering exists — suggests one. Use it to reorder cities, merge stops that sit right next to each other, or drop an extreme outlier before you finalize. Straight-line distance underestimates real travel time but reliably catches zig-zags and impractical jumps. Only useful for trips with two or more cities.",
+    "Sanity-check the geography of a multi-city route. List your cities IN THE ORDER you plan to visit them. Returns, per leg, the real ROAD travel time and distance between consecutive cities (driving via the OSRM road network), flags long hops, marks any leg that has no road route (an island or overseas hop the traveler would fly or ferry), and suggests a tighter order when one clearly exists. Use it to reorder cities, merge stops that sit right next to each other, drop an extreme outlier, or switch a punishing leg to a flight before you finalize. The road times are for ROUTING decisions, not a travel-time claim: a train or flight is often faster, so never cite a leg's road hours as how long the journey takes. If real road data is unavailable it falls back to straight-line distance. Only useful for trips with two or more cities.",
   input_schema: {
     type: "object",
     properties: {
@@ -396,6 +396,11 @@ function annotateItinerary(
   // countries of the cities that survived to emit (and drops it when none were covered) — the same
   // recompute-against-the-final-plan discipline the budget and season verdict follow.
   holidays: HolidaySummary | null,
+  // The last check_route call's stored road-time matrix, if any. buildRouteSummary re-derives the
+  // ordered legs from the FINAL emitted city order (so a displayed leg always matches the plan even
+  // if the model reordered after the route check) and returns null when there's nothing worth showing
+  // — the same recompute-against-the-final-plan discipline the budget and season verdict follow.
+  routeEstimate: StoredRouteMatrix | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -511,12 +516,17 @@ function annotateItinerary(
   // and the whole block when no surviving country was actually covered) — the budget/season recompute.
   const holidaysOut = recomputeHolidays(holidays, cities) ?? undefined;
 
+  // Recompute the route legs from the FINAL emitted city order (drops to null when there's no stored
+  // matrix, fewer than two cities, or nothing worth flagging) — the same recompute discipline.
+  const routeOut = buildRouteSummary(itinerary.cities.map((c) => c.name), routeEstimate) ?? undefined;
+
   return {
     ...itinerary,
     ...(budget ? { budget } : {}),
     ...(seasonOut ? { season: seasonOut } : {}),
     ...(flightsOut ? { flights: flightsOut } : {}),
     ...(holidaysOut ? { holidays: holidaysOut } : {}),
+    ...(routeOut ? { route: routeOut } : {}),
     cities,
   };
 }
@@ -725,6 +735,10 @@ export async function POST(req: Request) {
       // The grounded flights from the last find_flights call (attached only when it's a successful
       // Duffel search; an "unavailable" result attaches nothing but still informs the model).
       let flightEstimate: FlightResult | null = null;
+      // The grounded route (road-time matrix) from the last check_route call. The full matrix is kept
+      // server-side and recomputed against the FINAL emitted city order at annotate time; never sent
+      // to the model (it only ever sees the lean RouteModelView).
+      let routeEstimate: StoredRouteMatrix | null = null;
       // Does the plan span 2+ cities? Gates the check_route turn. Seed it from the prior
       // plan on a refine so a multi-city refine still gets a route check even if the model's
       // verify batch happens to under-represent the cities; the post-verify recompute below
@@ -923,6 +937,7 @@ export async function POST(req: Request) {
                 seasonEstimate,
                 flightEstimate,
                 holidayEstimate,
+                routeEstimate,
               ),
             });
             return;
@@ -1090,15 +1105,18 @@ export async function POST(req: Request) {
               }));
 
             send({ type: "status", phase: "routing", done: 0, total: cities.length });
-            const route = await checkRoute(
+            const { model: routeModel, stored: routeStored } = await checkRoute(
               cities,
               (done, total, name) => send({ type: "status", phase: "routing", done, total, name }),
               req.signal,
             );
+            // Keep the full matrix server-side for the annotate-time recompute; the model only sees
+            // the lean view (ordered legs + flags + suggestion + note), like seasonModelView.
+            routeEstimate = routeStored;
             messages.push({
               role: "user",
               content: [
-                { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(route) },
+                { type: "tool_result", tool_use_id: toolUse.id, content: JSON.stringify(routeModel) },
               ],
             });
             routedOnce = true;

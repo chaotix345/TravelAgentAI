@@ -16,6 +16,8 @@ import type {
   SeasonLabel,
   HolidaySummary,
   CountryHolidays,
+  RouteSummary,
+  RouteLeg,
 } from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
 
@@ -432,8 +434,12 @@ export default function Home() {
       )}
 
       <footer className="sources">
-        Grounded with free, keyless data: place checks via OpenStreetMap &amp; Wikipedia, distances
-        via OpenStreetMap, cost levels via World Bank &amp; Wikivoyage, and climate via{" "}
+        Grounded with free, keyless data: place checks via OpenStreetMap &amp; Wikipedia, road travel
+        times via{" "}
+        <a href="https://project-osrm.org" target="_blank" rel="noreferrer noopener">
+          OSRM
+        </a>{" "}
+        (OpenStreetMap contributors, ODbL), cost levels via World Bank &amp; Wikivoyage, and climate via{" "}
         <a href="https://open-meteo.com" target="_blank" rel="noreferrer noopener">
           Open-Meteo
         </a>{" "}
@@ -594,6 +600,7 @@ function Plan({
       {itinerary.flights && <FlightsBlock flights={itinerary.flights} />}
       {itinerary.season && <SeasonBlock season={itinerary.season} />}
       {itinerary.holidays && <HolidaysBlock holidays={itinerary.holidays} />}
+      {itinerary.route && <RouteBlock route={itinerary.route} />}
 
       {itinerary.cities.map((city, i) => (
         <article className="city" key={`${city.name}-${i}`}>
@@ -1240,6 +1247,79 @@ function HolidayCountry({
         </p>
       )}
     </div>
+  );
+}
+
+// "4h 40m" / "45m" / "11h" from a fractional-hours value. Mirrors fmtRoadTime in lib/route.ts so a
+// leg's figure and any server flag agree. Kept local — lib/route.ts is server-only (it geocodes/fetches).
+function fmtRoadTime(hours: number): string {
+  const total = Math.max(0, Math.round(hours * 60));
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
+}
+
+// The grounded route between cities, server-attached from the check_route tool. Trip-level block: the
+// real ROAD travel time + distance per leg (from OSRM), legs with no road route flagged "fly or
+// ferry", and an honest data-source/mode note. Like the budget and season, the figures are the tool's,
+// not the model's — and they're recomputed against the FINAL emitted city order. The server only
+// attaches this when there's signal (a long hop or a no-road leg), so a clean route renders nothing.
+// NOT a recommendation to drive — the label says "by road", the note says a train/flight may be faster.
+function RouteBlock({ route }: { route: RouteSummary }) {
+  const osrm = route.source === "osrm";
+  return (
+    <div className="route">
+      <div className="route-head">
+        <span className="route-title">Between cities</span>
+        {osrm ? (
+          <span
+            className="badge ok"
+            tabIndex={0}
+            title="Road travel times via OSRM (OpenStreetMap contributors, ODbL) — for comparing legs, not a recommendation to drive"
+          >
+            grounded
+          </span>
+        ) : (
+          <span
+            className="badge warn"
+            tabIndex={0}
+            title="Straight-line distances — real road times were unavailable; these underestimate actual travel time"
+          >
+            estimated
+          </span>
+        )}
+      </div>
+      <ul className="route-legs">
+        {route.legs.map((leg, i) => (
+          <RouteLegRow key={`${leg.from}-${leg.to}-${i}`} leg={leg} source={route.source} />
+        ))}
+      </ul>
+      <p className="route-note">{route.note}</p>
+    </div>
+  );
+}
+
+function RouteLegRow({ leg, source }: { leg: RouteLeg; source: "osrm" | "haversine" }) {
+  return (
+    <li className={`route-leg${leg.noRoadRoute ? " noroad" : ""}`}>
+      <span className="route-leg-cities">
+        {leg.from} <span className="route-arrow" aria-hidden="true">→</span> {leg.to}
+      </span>
+      {leg.noRoadRoute ? (
+        <span className="route-noroad">no road route — fly or ferry</span>
+      ) : source === "osrm" && leg.roadHours != null && leg.roadKm != null ? (
+        <span className="route-figure">
+          {fmtRoadTime(leg.roadHours)} by road · {String(leg.roadKm)} km
+        </span>
+      ) : leg.haversineKm != null ? (
+        <span className="route-figure muted">~{String(leg.haversineKm)} km straight-line</span>
+      ) : (
+        <span className="route-figure muted">distance unavailable</span>
+      )}
+      {leg.flag && <span className="route-leg-flag">{leg.flag}</span>}
+    </li>
   );
 }
 
