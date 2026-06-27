@@ -279,6 +279,43 @@ export type FlightSummary = {
   selection?: FlightSelection | null;
 };
 
+// Same Approach-B idea applied to the ROUTE — the multi-city geography between cities. When the
+// model calls check_route, the server geocodes the cities and grounds the legs in REAL road travel
+// times + distances from the keyless OSRM road network (falling back to straight-line haversine when
+// OSRM is unavailable), then attaches the result here. Like every other grounded value, the figures
+// the UI shows are OURS, not the model's claim — and they are RECOMPUTED against the FINAL emitted
+// city order (lib/route.ts buildRouteSummary), so a displayed leg always matches the plan even if the
+// model adopted check_route's suggested reorder before emitting. HONEST ABOUT MODE + SOURCE: road
+// times are NOT a recommendation to drive (a train or flight is often faster); a leg with no road
+// route (an island/overseas hop) is flagged "fly or ferry", never a fake distance across water; and a
+// fallback to straight-line is labelled as such, never dressed up as a real driving time. Self-
+// contained (no server-only import) so it's safe in the client bundle.
+export type RouteLeg = {
+  from: string;
+  to: string;
+  // OSRM road figures for this leg. roadKm/roadHours are null when there's no road route (noRoadRoute),
+  // when an endpoint failed to geocode, or under the straight-line fallback (source === "haversine").
+  roadKm: number | null;
+  roadHours: number | null; // driving duration in hours (e.g. 4.67 → "4h 40m"); UI formats h/m
+  // Straight-line km between the two cities. Shown ONLY under the haversine fallback; in OSRM mode it
+  // is server-side context (it sanity-checks the OSRM distance) and is null on a noRoadRoute leg, so
+  // the UI can never display a driveable-looking distance across open water.
+  haversineKm: number | null;
+  // true ⇒ OSRM has no usable road route for this pair (an explicit null cell, or a distance shorter
+  // than the straight line, which is geometrically impossible for a real road) ⇒ the traveler flies or
+  // ferries this leg. Only ever set in OSRM mode; never under the haversine fallback.
+  noRoadRoute: boolean;
+  // A per-leg advisory string when this leg is a long haul ("~9h by road — a long travel day …"), else
+  // null. Drives nothing structural; the UI shows it under the leg. The render gate is derived from the
+  // leg figures, not from this string.
+  flag: string | null;
+};
+export type RouteSummary = {
+  source: "osrm" | "haversine"; // "osrm" = real road times; "haversine" = straight-line fallback
+  legs: RouteLeg[]; // ordered, consecutive pairs from the FINAL emitted city list
+  note: string; // data-source + mode-honesty disclosure
+};
+
 export type VerifiedCity = Omit<City, "days"> & {
   days: VerifiedDay[];
   cost?: CityCostSummary;
@@ -290,4 +327,5 @@ export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
   season?: SeasonSummary;
   flights?: FlightSummary;
   holidays?: HolidaySummary;
+  route?: RouteSummary;
 };
