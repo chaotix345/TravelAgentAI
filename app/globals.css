@@ -809,6 +809,116 @@ button.link:hover {
   line-height: 1.45;
 }
 
+.holidays {
+  margin: 0 0 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.holidays-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.holidays-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.holiday-country {
+  margin: 14px 0 0;
+}
+
+.holiday-country-name {
+  font-size: 0.95rem;
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.holiday-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.holiday-list li {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 0.88rem;
+  padding: 5px 10px;
+  background: var(--accent-soft);
+  border-radius: 8px;
+}
+
+.holiday-list li.weekend {
+  background: var(--bg);
+}
+
+.holiday-date {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.holiday-name {
+  color: var(--ink);
+}
+
+.holiday-tag {
+  font-size: 0.72rem;
+  padding: 1px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.holiday-tag.warn {
+  color: var(--accent);
+  background: var(--card);
+  border: 1px solid var(--accent);
+}
+
+.holiday-tag.muted {
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.holiday-none {
+  margin: 6px 0 0;
+  font-size: 0.86rem;
+  color: var(--muted);
+}
+
+.holiday-caveat {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.holiday-coverage {
+  margin: 12px 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.holidays-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 .city-season {
   padding: 12px 18px 14px;
   border-top: 1px solid var(--line);
