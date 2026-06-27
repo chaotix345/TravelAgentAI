@@ -222,7 +222,7 @@ const BEST_TIME_TOOL: Anthropic.Tool = {
 const FIND_FLIGHTS_TOOL: Anthropic.Tool = {
   name: "find_flights",
   description:
-    "Price the FLIGHTS for the trip — the round-trip airfare that estimate_costs deliberately leaves out. Only useful when you know where the traveler DEPARTS FROM. Pass their origin (home city or IATA code), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country; omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. Returns the cheapest economy round-trip fare from a live flight-search API. Some results are flagged as TEST DATA (synthetic prices from a test airline) — when so, treat the fare as illustrative only, never a real quote. Call once, after the cities and month are settled.",
+    "Price the FLIGHTS for the trip — the round-trip airfare that estimate_costs deliberately leaves out. Only useful when you know where the traveler DEPARTS FROM. Pass their origin (home city or IATA code), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country; omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. Returns a recommended economy round-trip fare from a live flight-search API — usually the cheapest, but sometimes a fewer-stops fare within a small price band; the result's note says how it was chosen, so don't assume it's the cheapest. Some results are flagged as TEST DATA (synthetic prices from a test airline) — when so, treat the fare as illustrative only, never a real quote. Call once, after the cities and month are settled.",
   input_schema: {
     type: "object",
     properties: {

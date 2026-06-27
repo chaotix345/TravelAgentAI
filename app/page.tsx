@@ -785,7 +785,10 @@ function ConditionsRow({ conditions }: { conditions: FlightConditions }) {
 }
 
 const stopWord = (n: number) => (n === 0 ? "nonstop" : n === 1 ? "1 stop" : `${n} stops`);
-const stopWordHyphen = (n: number) => (n === 0 ? "nonstop" : `${n}-stop`);
+// Round-trip TOTAL across both legs (what the selection compares), worded so it can't be mistaken
+// for a per-leg count -- the route line above uses the per-leg "nonstop out · 1 stop back" form.
+const totalStopWord = (n: number) =>
+  n === 0 ? "nonstop" : `${n} stop${n === 1 ? "" : "s"} total`;
 
 // The "why this flight" line for a smart-selected (fewer-stops) fare — the decisive bit: it tells
 // the traveler we paid a little more to drop a connection, and exactly how much. Returns null when
@@ -814,11 +817,13 @@ function flightSelectionLine(
   const shownCur = opts.converted ? (flights.homeCurrency ?? "") : (flights.currency ?? "");
   let premium = "";
   if (chosenShown != null && cheapestShown != null && cheapestShown > 0 && chosenShown > cheapestShown) {
-    const diff = chosenShown - cheapestShown;
-    const pct = Math.round((diff / cheapestShown) * 100);
+    // Round the difference: the chosen fare is an integer but the native cheapest figure can be a
+    // float, so an unrounded diff could render as "A$29.8".
+    const diff = Math.round(chosenShown - cheapestShown);
+    const pct = Math.round(((chosenShown - cheapestShown) / cheapestShown) * 100);
     premium = ` — ${fmtMoney(diff, shownCur)}${pct > 0 ? ` (${pct}%)` : ""} more`;
   }
-  return `Chosen for fewer stops: ${stopWordHyphen(sel.chosenStops)} vs the cheapest ${stopWordHyphen(
+  return `Chosen for fewer stops: ${totalStopWord(sel.chosenStops)} vs the cheapest ${totalStopWord(
     sel.cheapestStops,
   )} fare${premium}.`;
 }

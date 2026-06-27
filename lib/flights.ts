@@ -636,19 +636,24 @@ export async function findFlights(
     // The "why this flight" record -- attached ONLY when we upgraded off the cheapest. cheapestAmount
     // is native currency; the route's FX pass converts it alongside the fare so the UI can show the
     // premium in the home currency without mixing currencies. NEVER reaches the model (UI-only).
+    const cheapestNative = parseAmount(choice.cheapest.total_amount);
     const selection: FlightSelection | null = choice.isUpgrade
       ? {
           reason: "fewer-stops",
           chosenStops: choice.chosenStops,
           cheapestStops: choice.cheapestStops,
-          cheapestAmount: parseAmount(choice.cheapest.total_amount),
+          // Round to whole units like the fare's own totalAmount (Math.round in summarizeOffer), so
+          // the UI's "X more than the cheapest" difference is never a fractional money string.
+          cheapestAmount: cheapestNative == null ? null : Math.round(cheapestNative),
           cheapestCurrency: choice.cheapest.total_currency ?? null,
           cheapestHomeAmount: null,
           homeCurrency: null,
         }
       : null;
 
-    onProgress?.(choice.isUpgrade ? "Pricing the best-value fare" : "Pricing the cheapest fare");
+    // Progress sub-labels are appended after "Pricing flights..." in the UI, so use a bare noun
+    // phrase (not another "Pricing ...") to avoid a doubled word.
+    onProgress?.(choice.isUpgrade ? "best-value fare" : "cheapest fare");
     const ctx = {
       origin,
       out: { fromCity: origin, fromCode: o.code, toCity: arriveCity, toCode: a.code, date: outISO },
@@ -680,14 +685,11 @@ export async function findFlights(
         );
         if (enrichRes.ok) {
           const rich = ((await enrichRes.json()) as { data?: DuffelRichOffer }).data;
-          // Guard against a body describing a DIFFERENT offer than we asked for (cache/test-env
-          // quirk): a mismatched id could overwrite the chosen fare's price/detail with another
-          // offer's, silently breaking the price floor. On mismatch, keep the lean summary.
-          if (rich && rich.id && rich.id !== chosen.id) {
-            console.warn(
-              `Duffel offer-detail id mismatch: asked ${chosen.id}, got ${rich.id}; using lean summary.`,
-            );
-          } else if (rich) {
+          // Enrich ONLY when the body POSITIVELY confirms it's the offer we asked for. A mismatched
+          // OR ABSENT id could overwrite the chosen fare's price/detail with another offer's body,
+          // silently breaking the "displayed price/stops are the tool's" invariant -- so require a
+          // matching id; anything else keeps the lean summary.
+          if (rich && rich.id === chosen.id) {
             // Re-price from the authoritative single-offer body, but if it came back without a
             // total_amount (a 200 with an incomplete body), keep the list price — a priced plan must
             // never silently become unpriced over the detail fetch (the additive-or-nothing rule).
@@ -700,6 +702,10 @@ export async function findFlights(
                 : { ...richLean, totalAmount: summary.totalAmount, currency: summary.currency },
               rich,
             );
+          } else if (rich) {
+            console.warn(
+              `Duffel offer-detail id mismatch/absent: asked ${chosen.id}, got ${rich.id ?? "none"}; using lean summary.`,
+            );
           }
         } else {
           console.warn(`Duffel offer-detail HTTP ${enrichRes.status}; using lean summary.`);
@@ -707,6 +713,20 @@ export async function findFlights(
       } catch {
         console.warn("Duffel offer-detail enrich failed; using lean summary.");
       }
+    }
+    // Re-validate the selection against the AUTHORITATIVE (post-enrich) chosen price. The enrich pass
+    // can reprice the chosen offer, and if it drifted ABOVE the band we selected within, the UI's
+    // "X% over the cheapest" line would exceed STOP_PREMIUM_THRESHOLD and contradict its own "chosen
+    // for fewer stops within a small price band" rationale. Drop the selection RECORD (so no "why
+    // this flight" line shows) while KEEPING the fewer-stops fare itself -- additive-or-nothing
+    // applied to the explanation, not the price.
+    if (
+      summary.selection?.cheapestAmount != null &&
+      summary.selection.cheapestAmount > 0 &&
+      summary.totalAmount != null &&
+      summary.totalAmount > summary.selection.cheapestAmount * (1 + STOP_PREMIUM_THRESHOLD)
+    ) {
+      summary = { ...summary, selection: null };
     }
     return summary;
   } catch (err) {
