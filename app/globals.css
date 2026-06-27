@@ -554,6 +554,19 @@ button.link:hover {
   font-weight: 500;
 }
 
+/* The "why this flight" line for a smart-selected (fewer-stops) fare. A soft accent pill so the
+   decisive value pick reads as a deliberate recommendation, not a disclaimer. */
+.flights-selection {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  background: var(--accent-soft);
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
 .flights-expiry {
   margin: 8px 0 0;
   color: var(--muted);

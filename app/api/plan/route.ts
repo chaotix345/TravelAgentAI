@@ -222,7 +222,7 @@ const BEST_TIME_TOOL: Anthropic.Tool = {
 const FIND_FLIGHTS_TOOL: Anthropic.Tool = {
   name: "find_flights",
   description:
-    "Price the FLIGHTS for the trip — the round-trip airfare that estimate_costs deliberately leaves out. Only useful when you know where the traveler DEPARTS FROM. Pass their origin (home city or IATA code), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country; omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. Returns the cheapest economy round-trip fare from a live flight-search API. Some results are flagged as TEST DATA (synthetic prices from a test airline) — when so, treat the fare as illustrative only, never a real quote. Call once, after the cities and month are settled.",
+    "Price the FLIGHTS for the trip — the round-trip airfare that estimate_costs deliberately leaves out. Only useful when you know where the traveler DEPARTS FROM. Pass their origin (home city or IATA code), the first city they fly into (arriveCity + country), the last city they fly home from (departCity + country; omit for a single-base trip), the travel month as YYYY-MM, and the trip's total nights. Returns a recommended economy round-trip fare from a live flight-search API — usually the cheapest, but sometimes a fewer-stops fare within a small price band; the result's note says how it was chosen, so don't assume it's the cheapest. Some results are flagged as TEST DATA (synthetic prices from a test airline) — when so, treat the fare as illustrative only, never a real quote. Call once, after the cities and month are settled.",
   input_schema: {
     type: "object",
     properties: {
@@ -1237,6 +1237,26 @@ export async function POST(req: Request) {
               send({ type: "status", phase: "flights", name: "converting to " + HOME });
               const flightFx = await getRate(result.currency, HOME, req.signal);
               result = applyFxToFlights(result, HOME, flightFx);
+              // Convert the smart-selection cheapest figure with the SAME rate the fare used (the
+              // cheapest offer shares the fare's currency). This keeps the UI's "X over the cheapest"
+              // comparison in one currency. Only when an upgrade was made and the fare actually
+              // converted; otherwise the UI falls back to the native cheapest figure (home === native).
+              if (
+                result.selection &&
+                result.rate != null &&
+                result.selection.cheapestAmount != null &&
+                result.selection.cheapestCurrency != null &&
+                result.selection.cheapestCurrency !== HOME
+              ) {
+                result = {
+                  ...result,
+                  selection: {
+                    ...result.selection,
+                    cheapestHomeAmount: Math.round(result.selection.cheapestAmount * result.rate),
+                    homeCurrency: HOME,
+                  },
+                };
+              }
             }
             // Penalty-condition FX pass. The refund/change penalties the enrich pass attached can be
             // quoted in a DIFFERENT currency than the fare (some carriers price them in USD/EUR

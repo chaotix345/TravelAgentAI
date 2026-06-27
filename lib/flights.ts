@@ -2,6 +2,7 @@ import type {
   FlightConditions,
   FlightLeg,
   FlightSegmentDetail,
+  FlightSelection,
   FlightSummary,
   SliceBaggage,
 } from "./schema";
@@ -56,6 +57,19 @@ const ENRICH_TIMEOUT_MS = 7000;
 const DAY_MS = 86_400_000;
 const DEFAULT_NIGHTS = 7; // return-date fallback when the model doesn't pass a night count
 const DEFAULT_LEAD_DAYS = 56; // ~8 weeks out when no travel month is known at all
+// How many of the cheapest offers to pull (was 1). We sort by total_amount ascending and take the
+// cheapest BAND so a deterministic server rule can prefer a nonstop/fewer-stops fare within reach of
+// the cheapest. Duffel's limit ranges 1-200 (default 50); 20 is plenty of price spread to find a
+// lower-stop option without paying for a huge response. The search itself is unchanged: we leave
+// max_connections at Duffel's default of 1, so the pool already mixes nonstop and 1-stop offers.
+const OFFERS_LIMIT = 20;
+// Smart-selection price band. We upgrade from the cheapest fare to a fewer-stops one ONLY when the
+// fewer-stops fare costs no more than (1 + this) x the cheapest. 0.20 = "pay up to 20% more to drop
+// a connection" -- a decisive travel agent's call, not a rock-bottom-at-all-costs one. It's a flat
+// PERCENTAGE (currency-agnostic) because selection runs in native currency BEFORE the FX pass, so a
+// home-currency absolute cap can't be applied here; the "Different flight option" refine chip is the
+// traveler's recourse if they'd rather have the cheapest. Tunable knob -- the whole feature's dial.
+const STOP_PREMIUM_THRESHOLD = 0.2;
 
 export type FlightInput = {
   origin: string; // departure city or IATA, inferred from the brief
@@ -224,8 +238,99 @@ type DuffelConditions = {
 type DuffelRichSlice = { segments?: DuffelRichSegment[]; conditions?: DuffelConditions };
 type DuffelRichOffer = DuffelOffer & { slices?: DuffelRichSlice[]; conditions?: DuffelConditions };
 
+// Stops in one slice = segments - 1. An EMPTY segments array is "no routing data", NOT a nonstop:
+// Math.max(0, [].length - 1) would wrongly read 0 (nonstop), so a missing/empty list returns null
+// (unknown). Selection treats null as Infinity so an offer with unknown routing is never preferred
+// over one with a counted, genuinely-lower stop count.
 const stopsFor = (slice: DuffelSlice | undefined): number | null =>
-  slice && Array.isArray(slice.segments) ? Math.max(0, slice.segments.length - 1) : null;
+  slice && Array.isArray(slice.segments) && slice.segments.length > 0
+    ? Math.max(0, slice.segments.length - 1)
+    : null;
+
+// Parse a Duffel money string ("451.20") to a finite number, or null when missing/malformed. Used
+// to compare offers in the price band — a non-finite price drops the offer from the comparison
+// rather than poisoning it with NaN.
+const parseAmount = (v: string | null | undefined): number | null => {
+  if (v == null) return null;
+  const n = Number.parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+// Total stops across ALL slices of an offer (out + return). null when ANY slice's routing is unknown
+// (a missing/empty segments array) -- we won't claim a stop count we can't fully see. Pure.
+function totalStops(offer: DuffelOffer): number | null {
+  const slices = Array.isArray(offer.slices) ? offer.slices : [];
+  if (slices.length === 0) return null;
+  let total = 0;
+  for (const s of slices) {
+    const st = stopsFor(s);
+    if (st === null) return null; // one unknown leg makes the whole-trip count unknown
+    total += st;
+  }
+  return total;
+}
+
+// The result of the smart-selection rule: which offer to price, the absolute-cheapest it was chosen
+// against, and whether that was an upgrade (a strictly-fewer-stops pick) vs just keeping the cheapest.
+export type OfferChoice = {
+  chosen: DuffelOffer;
+  cheapest: DuffelOffer;
+  isUpgrade: boolean;
+  chosenStops: number | null;
+  cheapestStops: number | null;
+};
+
+// SMART FLIGHT SELECTION (pure, no network -- the heart of this milestone, fully unit-testable).
+// Given the cheapest-first offers list, pick the fare a decisive travel agent would: among offers
+// within STOP_PREMIUM_THRESHOLD of the cheapest price, take the one with the FEWEST total stops; if
+// none beats the cheapest on stops, KEEP the cheapest exactly (never pay more for equal/worse
+// routing). offers[0] is the absolute cheapest because the caller sorts by total_amount ascending.
+// Degrades safely: empty list -> null; unparseable/zero cheapest price, or a cheapest with unknown or
+// already-zero stops -> keep cheapest (no upgrade). Compares only same-currency offers as a guard,
+// though one Duffel search returns a single currency.
+export function chooseOffer(
+  offers: DuffelOffer[],
+  threshold: number = STOP_PREMIUM_THRESHOLD,
+): OfferChoice | null {
+  if (!offers.length) return null;
+  const cheapest = offers[0];
+  const cheapestStops = totalStops(cheapest);
+  const base: OfferChoice = {
+    chosen: cheapest,
+    cheapest,
+    isUpgrade: false,
+    chosenStops: cheapestStops,
+    cheapestStops,
+  };
+  const cheapestAmount = parseAmount(cheapest.total_amount);
+  // Can't band-filter without a valid positive baseline price -> take the sort-order winner.
+  if (cheapestAmount === null || cheapestAmount <= 0) return base;
+  // Nothing to improve: the cheapest is already nonstop, or its routing is unknown (don't gamble on
+  // an "upgrade" when we can't even count the baseline's stops).
+  if (cheapestStops === null || cheapestStops === 0) return base;
+
+  const cap = cheapestAmount * (1 + threshold);
+  let best = cheapest;
+  let bestStops = cheapestStops;
+  for (const o of offers) {
+    if (o === cheapest) continue;
+    // Same-currency band only (belt-and-suspenders; one offer_request returns one currency).
+    if ((o.total_currency ?? null) !== (cheapest.total_currency ?? null)) continue;
+    const amt = parseAmount(o.total_amount);
+    if (amt === null || amt > cap) continue; // outside the price band
+    const st = totalStops(o);
+    if (st === null) continue; // unknown routing is never preferred
+    // Strictly fewer stops wins; ties go to the lower price, which -- since the list is
+    // price-ascending -- is already the earlier offer, so we only replace on a STRICT improvement.
+    if (st < bestStops) {
+      best = o;
+      bestStops = st;
+    }
+  }
+  return best !== cheapest && bestStops < cheapestStops
+    ? { chosen: best, cheapest, isUpgrade: true, chosenStops: bestStops, cheapestStops }
+    : base;
+}
 
 // Parse Duffel's ISO-8601 segment duration ("PT6H30M", "P1DT2H15M") to whole minutes, or null on a
 // missing/malformed value. Days/hours/minutes only — flight legs never carry months or years.
@@ -305,6 +410,13 @@ export function summarizeOffer(
     back: { fromCity: string; fromCode: string; toCity: string; toCode: string; date: string } | null;
     month: string | null | undefined;
     apiKey: string;
+    // Smart-selection context. smartSelected flips the note from "Cheapest" to "Selected for fewer
+    // stops" so the card AND the model's tool_result are truthful about a non-cheapest pick.
+    // selection is the UI's "why this flight" record, threaded through ctx so it survives the
+    // enrich pass (which re-summarizes from the rich payload using this same ctx). Both default
+    // to the cheapest-kept behaviour, so existing callers/tests are unaffected.
+    smartSelected?: boolean;
+    selection?: FlightSelection | null;
   },
 ): FlightSummary {
   // Trust the offer's own live_mode flag for the test-mode verdict; fall back to the token prefix
@@ -323,7 +435,10 @@ export function summarizeOffer(
   // "2026-13"/"2026-00" can't index MONTHS out of range and print "mid-undefined".
   const mn = ctx.month && /^\d{4}-\d{2}$/.test(ctx.month) ? Number(ctx.month.slice(5, 7)) : 0;
   const monthName = mn >= 1 && mn <= 12 ? MONTHS[mn - 1] : null;
-  const basis = `Cheapest economy round-trip for 1 adult, ${
+  const lead = ctx.smartSelected
+    ? "Economy round-trip for 1 adult, selected for fewer stops,"
+    : "Cheapest economy round-trip for 1 adult,";
+  const basis = `${lead} ${
     monthName ? `a representative mid-${monthName} date` : "a representative near-term date"
   } (excludes bags and seat fees).`;
   const note = testMode
@@ -342,6 +457,9 @@ export function summarizeOffer(
     airline: offer.owner?.name ?? null,
     cabin: "economy",
     note,
+    // Attach the smart-selection record (UI-only) when one was made. Threaded via ctx so the enrich
+    // re-summarize keeps it -- the summary would otherwise be rebuilt from the rich payload and lose it.
+    ...(ctx.selection ? { selection: ctx.selection } : {}),
   };
 }
 
@@ -495,8 +613,10 @@ export async function findFlights(
       return unavailable(origin, "error", "Flight search returned no results to price.");
     }
 
+    // Pull the cheapest BAND of offers (sorted ascending), not just the single cheapest, so the
+    // server rule below can prefer a fewer-stops fare within reach of the cheapest price.
     const offersRes = await duffelFetch(
-      `/air/offers?offer_request_id=${encodeURIComponent(offerRequestId)}&sort=total_amount&limit=1`,
+      `/air/offers?offer_request_id=${encodeURIComponent(offerRequestId)}&sort=total_amount&limit=${OFFERS_LIMIT}`,
       apiKey,
       { timeoutMs: OFFERS_TIMEOUT_MS, signal },
     );
@@ -505,22 +625,47 @@ export async function findFlights(
       return unavailable(origin, "error", `Couldn't read fares (Duffel HTTP ${offersRes.status}).`);
     }
     const offersJson = (await offersRes.json()) as { data?: DuffelOffer[] };
-    const cheapest = Array.isArray(offersJson.data) ? offersJson.data[0] : undefined;
-    if (!cheapest) {
+    const offers = Array.isArray(offersJson.data) ? offersJson.data : [];
+    // SMART SELECTION: choose the fare a decisive agent would (fewest stops within the price band),
+    // falling back to the absolute cheapest. A null result means the list was empty.
+    const choice = chooseOffer(offers);
+    if (!choice) {
       return unavailable(origin, "no-offers", "No flights came back for those cities and dates.");
     }
+    const chosen = choice.chosen;
+    // The "why this flight" record -- attached ONLY when we upgraded off the cheapest. cheapestAmount
+    // is native currency; the route's FX pass converts it alongside the fare so the UI can show the
+    // premium in the home currency without mixing currencies. NEVER reaches the model (UI-only).
+    const cheapestNative = parseAmount(choice.cheapest.total_amount);
+    const selection: FlightSelection | null = choice.isUpgrade
+      ? {
+          reason: "fewer-stops",
+          chosenStops: choice.chosenStops,
+          cheapestStops: choice.cheapestStops,
+          // Round to whole units like the fare's own totalAmount (Math.round in summarizeOffer), so
+          // the UI's "X more than the cheapest" difference is never a fractional money string.
+          cheapestAmount: cheapestNative == null ? null : Math.round(cheapestNative),
+          cheapestCurrency: choice.cheapest.total_currency ?? null,
+          cheapestHomeAmount: null,
+          homeCurrency: null,
+        }
+      : null;
 
-    onProgress?.("Pricing the cheapest fare");
+    // Progress sub-labels are appended after "Pricing flights..." in the UI, so use a bare noun
+    // phrase (not another "Pricing ...") to avoid a doubled word.
+    onProgress?.(choice.isUpgrade ? "best-value fare" : "cheapest fare");
     const ctx = {
       origin,
       out: { fromCity: origin, fromCode: o.code, toCity: arriveCity, toCode: a.code, date: outISO },
       back: { fromCity: returnFromCity, fromCode: back.code, toCity: origin, toCode: o.code, date: retISO },
       month: input.month,
       apiKey,
+      smartSelected: choice.isUpgrade,
+      selection,
     };
     // Lean summary from the LIST offer — always valid, always has the price and route. If the
     // enrich pass below fails, this is exactly what we return (additive-or-nothing, like the FX pass).
-    let summary = summarizeOffer(cheapest, ctx);
+    let summary = summarizeOffer(chosen, ctx);
 
     // --- The server-enrich pass ---------------------------------------------------------------
     // A second, server-to-server GET /air/offers/{id} pulls the booking-ready detail the LIST
@@ -530,26 +675,36 @@ export async function findFlights(
     // list's), keeping the ID, price, legs, and detail mutually consistent. Any failure — timeout,
     // 429, 404 on an already-expired offer, a malformed body — degrades to the lean summary: a
     // priced plan never becomes unpriced over a slow or failed detail fetch.
-    if (cheapest.id) {
+    if (chosen.id) {
       try {
         onProgress?.("Fetching booking detail");
         const enrichRes = await duffelFetch(
-          `/air/offers/${encodeURIComponent(cheapest.id)}`,
+          `/air/offers/${encodeURIComponent(chosen.id)}`,
           apiKey,
           { timeoutMs: ENRICH_TIMEOUT_MS, signal },
         );
         if (enrichRes.ok) {
           const rich = ((await enrichRes.json()) as { data?: DuffelRichOffer }).data;
-          if (rich) {
+          // Enrich ONLY when the body POSITIVELY confirms it's the offer we asked for. A mismatched
+          // OR ABSENT id could overwrite the chosen fare's price/detail with another offer's body,
+          // silently breaking the "displayed price/stops are the tool's" invariant -- so require a
+          // matching id; anything else keeps the lean summary.
+          if (rich && rich.id === chosen.id) {
             // Re-price from the authoritative single-offer body, but if it came back without a
             // total_amount (a 200 with an incomplete body), keep the list price — a priced plan must
             // never silently become unpriced over the detail fetch (the additive-or-nothing rule).
+            // ctx carries the selection record, so the re-summarize keeps it (summary would otherwise
+            // be rebuilt from the rich payload and drop it).
             const richLean = summarizeOffer(rich, ctx);
             summary = enrichSummary(
               richLean.totalAmount != null
                 ? richLean
                 : { ...richLean, totalAmount: summary.totalAmount, currency: summary.currency },
               rich,
+            );
+          } else if (rich) {
+            console.warn(
+              `Duffel offer-detail id mismatch/absent: asked ${chosen.id}, got ${rich.id ?? "none"}; using lean summary.`,
             );
           }
         } else {
@@ -558,6 +713,20 @@ export async function findFlights(
       } catch {
         console.warn("Duffel offer-detail enrich failed; using lean summary.");
       }
+    }
+    // Re-validate the selection against the AUTHORITATIVE (post-enrich) chosen price. The enrich pass
+    // can reprice the chosen offer, and if it drifted ABOVE the band we selected within, the UI's
+    // "X% over the cheapest" line would exceed STOP_PREMIUM_THRESHOLD and contradict its own "chosen
+    // for fewer stops within a small price band" rationale. Drop the selection RECORD (so no "why
+    // this flight" line shows) while KEEPING the fewer-stops fare itself -- additive-or-nothing
+    // applied to the explanation, not the price.
+    if (
+      summary.selection?.cheapestAmount != null &&
+      summary.selection.cheapestAmount > 0 &&
+      summary.totalAmount != null &&
+      summary.totalAmount > summary.selection.cheapestAmount * (1 + STOP_PREMIUM_THRESHOLD)
+    ) {
+      summary = { ...summary, selection: null };
     }
     return summary;
   } catch (err) {
