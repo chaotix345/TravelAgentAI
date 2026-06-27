@@ -9,6 +9,7 @@ import type {
   BudgetSummary,
   FlightSummary,
   FlightConditions,
+  FlightSelection,
   SliceBaggage,
   SeasonSummary,
   CitySeasonSummary,
@@ -783,6 +784,45 @@ function ConditionsRow({ conditions }: { conditions: FlightConditions }) {
   );
 }
 
+const stopWord = (n: number) => (n === 0 ? "nonstop" : n === 1 ? "1 stop" : `${n} stops`);
+const stopWordHyphen = (n: number) => (n === 0 ? "nonstop" : `${n}-stop`);
+
+// The "why this flight" line for a smart-selected (fewer-stops) fare — the decisive bit: it tells
+// the traveler we paid a little more to drop a connection, and exactly how much. Returns null when
+// there's nothing honest to say: the cheapest was kept (no selection), the data is synthetic
+// (testMode — its spreads are meaningless), the offer expired, or the stop figures are missing.
+// Compares chosen vs cheapest in ONE currency (home when the fare converted, else native), and
+// omits the premium entirely if the two figures can't be compared in the same currency.
+function flightSelectionLine(
+  flights: FlightSummary,
+  opts: { converted: boolean; isExpired: boolean },
+): string | null {
+  const sel: FlightSelection | null | undefined = flights.selection;
+  if (
+    !sel ||
+    sel.reason !== "fewer-stops" ||
+    flights.testMode ||
+    opts.isExpired ||
+    sel.chosenStops == null ||
+    sel.cheapestStops == null ||
+    sel.chosenStops >= sel.cheapestStops
+  ) {
+    return null;
+  }
+  const chosenShown = opts.converted ? (flights.homeAmount ?? null) : flights.totalAmount;
+  const cheapestShown = opts.converted ? (sel.cheapestHomeAmount ?? null) : sel.cheapestAmount;
+  const shownCur = opts.converted ? (flights.homeCurrency ?? "") : (flights.currency ?? "");
+  let premium = "";
+  if (chosenShown != null && cheapestShown != null && cheapestShown > 0 && chosenShown > cheapestShown) {
+    const diff = chosenShown - cheapestShown;
+    const pct = Math.round((diff / cheapestShown) * 100);
+    premium = ` — ${fmtMoney(diff, shownCur)}${pct > 0 ? ` (${pct}%)` : ""} more`;
+  }
+  return `Chosen for fewer stops: ${stopWordHyphen(sel.chosenStops)} vs the cheapest ${stopWordHyphen(
+    sel.cheapestStops,
+  )} fare${premium}.`;
+}
+
 function FlightsBlock({ flights }: { flights: FlightSummary }) {
   const [detailOpen, setDetailOpen] = useState(false);
   // Offer expiry is computed CLIENT-SIDE from the stored timestamp — no server round-trip. A plan
@@ -802,16 +842,26 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
     const t = setTimeout(bumpClock, delay);
     return () => clearTimeout(t);
   }, [expiryMs]);
-  // Stops come from the outbound leg the tool counted; the card was silently dropping this.
+  // Stops come from the segments the tool counted. Describe BOTH legs honestly: smart selection
+  // compares TOTAL round-trip stops, so an outbound-only label could read "nonstop" while the
+  // return has a connection. Collapse to one word when both legs match; show per-leg when they
+  // differ; fall back to the single leg for a one-way result.
   const outStops = flights.legs[0]?.stops ?? null;
+  const backStops = flights.legs.length > 1 ? (flights.legs[1]?.stops ?? null) : null;
   const stopsLabel =
-    outStops === 0
-      ? "nonstop"
-      : outStops === 1
-        ? "1 stop"
+    flights.legs.length > 1
+      ? outStops != null && backStops != null
+        ? outStops === backStops
+          ? stopWord(outStops)
+          : `${stopWord(outStops)} out · ${stopWord(backStops)} back`
         : outStops != null
-          ? `${outStops} stops`
-          : null;
+          ? `${stopWord(outStops)} out`
+          : backStops != null
+            ? `${stopWord(backStops)} back`
+            : null
+      : outStops != null
+        ? stopWord(outStops)
+        : null;
   const code = flights.currency ?? "";
   // Lead with the home-currency fare and keep Duffel's native quote beside it — this is what turns
   // a stray "A$126" sandbox fare into "≈ £66 (A$126)". Show native-only when no conversion ran.
@@ -838,6 +888,7 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
       : roundTrip
         ? `${legs[0].fromCity} ⇄ ${legs[0].toCity}`
         : legs.map((l) => `${l.fromCity} → ${l.toCity}`).join(" · ");
+  const selLine = flightSelectionLine(flights, { converted, isExpired });
 
   return (
     <div className="flights">
@@ -879,6 +930,7 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
           {stopsLabel ? <span className="flights-stops"> · {stopsLabel}</span> : null}
         </p>
       )}
+      {selLine && <p className="flights-selection">{selLine}</p>}
       <p className="flights-note">{flights.note}</p>
       {converted && flights.rate != null && (
         <FxNote
@@ -910,6 +962,9 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
               {flights.testMode && (
                 <p className="flights-detail-test">
                   Illustrative detail from Duffel&apos;s test environment — not a real flight.
+                  {flights.selection?.reason === "fewer-stops"
+                    ? " (Stop-aware selection ran, but the comparison is meaningless on synthetic fares.)"
+                    : ""}
                 </p>
               )}
               {flights.sliceSegments.map((segs, si) => (

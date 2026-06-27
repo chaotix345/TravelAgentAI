@@ -1237,6 +1237,26 @@ export async function POST(req: Request) {
               send({ type: "status", phase: "flights", name: "converting to " + HOME });
               const flightFx = await getRate(result.currency, HOME, req.signal);
               result = applyFxToFlights(result, HOME, flightFx);
+              // Convert the smart-selection cheapest figure with the SAME rate the fare used (the
+              // cheapest offer shares the fare's currency). This keeps the UI's "X over the cheapest"
+              // comparison in one currency. Only when an upgrade was made and the fare actually
+              // converted; otherwise the UI falls back to the native cheapest figure (home === native).
+              if (
+                result.selection &&
+                result.rate != null &&
+                result.selection.cheapestAmount != null &&
+                result.selection.cheapestCurrency != null &&
+                result.selection.cheapestCurrency !== HOME
+              ) {
+                result = {
+                  ...result,
+                  selection: {
+                    ...result.selection,
+                    cheapestHomeAmount: Math.round(result.selection.cheapestAmount * result.rate),
+                    homeCurrency: HOME,
+                  },
+                };
+              }
             }
             // Penalty-condition FX pass. The refund/change penalties the enrich pass attached can be
             // quoted in a DIFFERENT currency than the fare (some carriers price them in USD/EUR

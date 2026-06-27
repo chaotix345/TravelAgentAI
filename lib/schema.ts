@@ -198,6 +198,24 @@ export type FlightConditions = {
   penaltyHomeCurrency: string | null; // ISO currency the *Home penalty figures are converted to
 };
 
+// Why a non-cheapest offer was chosen -- the "smart selection" record. Attached ONLY when the
+// server picked a lower-stop fare over the absolute cheapest (within a price band); absent when the
+// cheapest was already the best, so its mere presence means "we upgraded you off the cheapest". The
+// figures describe the fare we SKIPPED (the cheapest) so the UI can show an honest "nonstop, A$40
+// (8%) over the cheapest 1-stop fare" line. cheapestAmount is native currency (the same currency as
+// the fare, since all offers in one Duffel search share it); cheapestHomeAmount is that figure
+// converted by the same FX pass that converts the fare, so the UI never mixes currencies. Self-
+// contained (no server-only import) for the client bundle. NEVER sent to the model -- UI-only.
+export type FlightSelection = {
+  reason: "fewer-stops";
+  chosenStops: number | null; // total stops across both legs of the fare we CHOSE
+  cheapestStops: number | null; // total stops of the absolute-cheapest fare we skipped
+  cheapestAmount: number | null; // the skipped cheapest fare's price, native currency
+  cheapestCurrency: string | null; // ISO 4217 of cheapestAmount (matches the fare's currency)
+  cheapestHomeAmount?: number | null; // cheapestAmount converted to home currency by the FX pass
+  homeCurrency?: string | null; // ISO the *Home figure is in
+};
+
 export type FlightSummary = {
   source: "duffel"; // only ever attached when a real Duffel search ran
   testMode: boolean; // true → synthetic test data → show the disclaimer
@@ -226,6 +244,10 @@ export type FlightSummary = {
   sliceSegments?: FlightSegmentDetail[][] | null; // [outbound segments, return segments]
   sliceBaggage?: SliceBaggage[] | null; // [outbound, return] baggage, parallel to sliceSegments
   conditions?: FlightConditions | null; // offer-level refund/change terms
+  // Smart flight selection (server-side rule, not a model decision): present ONLY when we chose a
+  // lower-stop fare over the absolute cheapest. Drives the UI's "why this flight" line; gated to
+  // non-test fares in the UI since synthetic test spreads are meaningless. Absent => cheapest kept.
+  selection?: FlightSelection | null;
 };
 
 export type VerifiedCity = Omit<City, "days"> & {
