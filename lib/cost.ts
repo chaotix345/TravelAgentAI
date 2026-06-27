@@ -154,6 +154,14 @@ function lookupCountry(country?: string): CountryPriceLevel | null {
   return null;
 }
 
+// Resolve a traveler-facing country NAME to its ISO 3166-1 alpha-2 code (e.g. "France" -> "FR"),
+// reusing the same fold + alias + bundled World Bank table the budget tool already uses. Exposed so
+// the holiday tool (lib/holidays.ts) can call Nager.Date — which keys on alpha-2 — WITHOUT a second
+// country table. Returns null when the name doesn't resolve, so holidays degrade to "no data".
+export function countryIso2(country?: string): string | null {
+  return lookupCountry(country)?.iso2 ?? null;
+}
+
 // --- Wikivoyage price anchors ---------------------------------------------------------------
 // Best-effort extraction of a few REAL, verbatim price snippets from a city's Wikivoyage
 // article. These illustrate the tier with sourced examples; they're not cross-compared or used

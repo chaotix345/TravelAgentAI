@@ -7,10 +7,10 @@ things to do. No wall of options. It has an opinion.
 
 This is **v1.5+ (Approach B + C)** from `DESIGN.md`: a grounded, streaming agent. It may
 ask one or two quick questions first (only when they'd change the plan), then drafts a
-route and **grounds it in real data with four keyless tools** — it verifies the named places
+route and **grounds it in real data with five keyless tools** — it verifies the named places
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
-Wikivoyage), and grounds the **timing** in real climate normals (Open-Meteo) — all in a single
+Wikivoyage), grounds the **timing** in real climate normals (Open-Meteo), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
 one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
@@ -80,9 +80,9 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   and runs the agent loop, **streaming** newline-delimited JSON progress events. Claude is
   *forced* to verify its named places first (`verify_places`); then it's offered the optional
   grounding tools it hasn't spent yet — `check_route` (multi-city only), `estimate_costs`,
-  `best_time_to_go`, and (only when a Duffel key is set) `find_flights` — alongside `emit`, picking
+  `best_time_to_go`, `check_holidays`, and (only when a Duffel key is set) `find_flights` — alongside `emit`, picking
   one per turn until none remain; finally it is *forced* to emit the itinerary. The verification
-  verdict, the grounded budget, the grounded seasonality **and** the grounded flights are attached
+  verdict, the grounded budget, the grounded seasonality, the grounded public holidays **and** the grounded flights are attached
   on the server before it streams back. A sanitized `origin` (from the **"Flying from?"** field) is
   appended to the brief as a user-turn line and makes flight pricing a **required** step — the loop
   withholds `emit` until `find_flights` has run — so naming where you fly from reliably lights up the
@@ -138,6 +138,18 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   process-lifetime cache (normals barely change) and graceful degradation to "no data" on any
   error. The thresholds are documented, tunable heuristics. It grounds **weather** only — there's
   no keyless source for tourist crowds — and says so in a caveat.
+- **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
+  The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
+  *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)
+  it calls the keyless **Nager.Date** calendar, keeps the nationwide statutory closures
+  (Public/Bank, in the target month), and derives day-of-week + long-weekend server-side (with the
+  Friday–Saturday weekend handled for the countries that use it). The model uses it to move a visit
+  off a day a holiday closes it, flag a long-weekend travel surge, or call out a holiday worth being
+  there for. Honest about its limits: it grounds **closures**, not measured crowds; an uncovered
+  country (Nager has ~150) reads as "no data", never a false "no holidays"; and it flags that Islamic
+  holidays (Eid/Ramadan) are absent even for countries it otherwise covers. Reuses `costData.ts`'s
+  `iso2` (no new country table), and is server-attached and recomputed against the final cities, like
+  the budget and season.
 - **`lib/flights.ts`** — executes the `find_flights` tool, the **first tool that needs an API key**
   (Duffel). It resolves each city name to an IATA code via Duffel's own Places endpoint (no
   hardcoded map), then makes ONE round-trip offer request (two slices: out + return) with raw
@@ -164,11 +176,11 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   tool — the reliable way to get structured JSON back. The response is validated with the
   same Zod schema before it reaches the UI. Enriched `Verified*` types add the per-activity
   verdict, and self-contained `BudgetSummary` / `CityCostSummary` / `SeasonSummary` / `MonthSeason`
-  / `FlightSummary` types carry the server-attached, grounded budget, seasonality and flights (kept
+  / `FlightSummary` / `HolidaySummary` types carry the server-attached, grounded budget, seasonality, holidays and flights (kept
   import-free so the client bundle never pulls in the cost data, climate fetch, scoring logic, or
   Duffel client).
 - **`lib/prompt.ts`** — two system prompts: the decisive-travel-agent personality for the
-  planner (describing the four keyless grounding tools and when to spend the optional ones), plus a
+  planner (describing the five keyless grounding tools and when to spend the optional ones), plus a
   `FLIGHTS_CLAUSE` appended to it **only when a Duffel key is configured** (capability-conditional
   prompting — the planner hears about `find_flights` exactly when it can use it); and a tight
   "ask only if it matters" prompt for the clarify step.
@@ -187,12 +199,13 @@ turn 2…: Claude is offered the optional tools it hasn't spent + emit, picks ON
            check_route([cities])      # multi-city only — geocode + leg distances + flags
            estimate_costs([cities])   # cost tier + daily budget + Wikivoyage price anchors
            best_time_to_go([cities])  # 12-month climate normals -> peak/shoulder/off + best window
+           check_holidays([cities])   # public-holiday closures + long weekends in the trip month
            find_flights([...])        # ONLY if a Duffel key is set — cheapest round-trip fare
            emit_itinerary({...})      # done
-         (route/cost/timing/flights each gated to one use; cost, timing & flights wait until the
+         (route/cost/timing/holidays/flights each gated to one use; cost, timing, holidays & flights wait until the
           route is settled, so they see the final city set)
 turn N:  Claude -> tool_use: emit_itinerary({...})    # FORCED once nothing optional remains
-         attach our verdicts + grounded budget + seasonality + flights -> render badges
+         attach our verdicts + grounded budget + seasonality + holidays + flights -> render badges
 ```
 
 Three things make this sturdy:

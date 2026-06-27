@@ -142,6 +142,35 @@ export type SeasonSummary = {
   note: string; // data-source disclosure
   caveat: string; // weather-vs-crowds honesty disclaimer
 };
+// Same Approach-B idea applied to PUBLIC HOLIDAYS: when the model calls check_holidays, the route
+// grounds the trip's countries in statutory public holidays (Nager.Date) and attaches the result
+// here. Like the verify verdict, the budget and the season, what the UI shows is OURS (computed in
+// lib/holidays.ts), not a claim the model made. Holidays are a proxy for CLOSURES + likely
+// long-weekend domestic travel — never measured tourist crowds (same honest-about-limits stance the
+// season tool takes). Self-contained (no server-only import) so the client bundle stays clean.
+export type HolidayItem = {
+  date: string; // YYYY-MM-DD
+  name: string; // English name, e.g. "Bastille Day"
+  localName: string; // native-language name, e.g. "Fête nationale"
+  dayOfWeek: string; // "Monday" … computed server-side from the date
+  weekend: boolean; // falls on Sat/Sun — already a day off, so less disruptive
+  longWeekend: boolean; // Mon/Fri — bridges a weekend → heavier domestic travel likely
+  closure: boolean; // a Public/Bank holiday → government, banks, some attractions closed
+};
+export type CountryHolidays = {
+  country: string; // display name, as the plan uses it
+  iso2: string | null; // resolved ISO 3166-1 alpha-2 (e.g. "FR"), or null when unresolved
+  source: "nager" | "none"; // "none" → country not covered / lookup failed → show "no data", not "no holidays"
+  holidays: HolidayItem[]; // target-month nationwide closures; [] when covered-but-none, or no data
+  islamicCaveat: boolean; // Nager omits Islamic holidays (Eid/Ramadan) for this country → say so
+};
+export type HolidaySummary = {
+  targetMonth: number; // 1–12, the month the trip is for
+  year: number; // the calendar year inferred for that month
+  countries: CountryHolidays[];
+  note: string; // data-source disclosure
+  caveat: string; // closures-vs-crowds honesty disclaimer
+};
 // Same Approach-B idea applied to FLIGHTS — but this is the FIRST tool that needs an API KEY
 // (Duffel). When a Duffel key is configured the agent can call find_flights, and the route
 // attaches the cheapest round-trip the tool found here. Like every other grounded value, this is
@@ -260,4 +289,5 @@ export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
   budget?: BudgetSummary;
   season?: SeasonSummary;
   flights?: FlightSummary;
+  holidays?: HolidaySummary;
 };

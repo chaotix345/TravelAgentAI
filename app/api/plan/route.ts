@@ -6,6 +6,7 @@ import {
   type BudgetSummary,
   type CitySeasonSummary,
   type FlightSummary,
+  type HolidaySummary,
   type Itinerary,
   type SeasonSummary,
   type VerifiedItinerary,
@@ -16,6 +17,7 @@ import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
 import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
+import { assessHolidays, holidayModelView, recomputeHolidays } from "@/lib/holidays";
 import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
 import { homeCurrency, getRate, applyFxToCost, applyFxToFlights, costModelView } from "@/lib/currency";
 
@@ -46,15 +48,15 @@ const MAX_BODY_CHARS = 1_000_000;
 // chooses to use adds one turn: estimate_costs, best_time_to_go and (when a Duffel key is set)
 // find_flights for a single-city trip, or check_route + those three for multi-city — each gated to
 // a single use. So the longest legitimate path is verify-retry -> verify -> check_route ->
-// estimate_costs -> best_time_to_go -> find_flights -> emit = 7 turns. The bounded repair round
+// estimate_costs -> best_time_to_go -> check_holidays -> find_flights -> emit = 8 turns. The repair round
 // (a second forced verify when round 1 finds places that don't exist) adds one to the longest path:
 // empty-verify -> verify -> repair-verify -> check_route -> estimate_costs -> best_time_to_go ->
-// find_flights -> emit = 8 turns; 9 leaves a turn of headroom. Each optional tool (and the repair
+// check_holidays -> find_flights -> emit = 9 turns; 10 leaves a turn of headroom. Each optional tool (and the repair
 // round) is gated to one use, so the loop can't spin. Guards against anything unexpected so a
 // request can't run forever.
 // When the traveler gives an explicit origin, emit is withheld until find_flights runs — but that
 // just FILLS the already-budgeted flights turn rather than adding one, so this bound is unchanged.
-const MAX_TURNS = 9;
+const MAX_TURNS = 10;
 // Genuine not-found places (absent from the free geo database — NOT a lookup that just errored)
 // that are a small slice of the plan trigger one repair round. But when they reach this fraction of
 // all submitted places, the draft is broadly broken (or the geo backend is flaking) and re-inventing
@@ -215,8 +217,43 @@ const BEST_TIME_TOOL: Anthropic.Tool = {
   } as Anthropic.Tool.InputSchema,
 };
 
+const CHECK_HOLIDAYS_TOOL: Anthropic.Tool = {
+  name: "check_holidays",
+  description:
+    "Ground the PUBLIC HOLIDAYS of the trip — the closures and domestic-travel surges best_time_to_go leaves out (it covers weather only). Pass your cities (each with its country) and the targetMonth (1-12) of the trip. Returns, per country, the nationwide statutory public holidays that fall in that month — each with its date, day of the week, and whether it forms a long weekend — from the free Nager.Date calendar. Use it to: WARN the traveler when a holiday closes museums, shops or banks on a day they'd visit them (and move that visit to an open day), note when a long weekend means heavier domestic travel and busier transport, and call out a holiday that's a genuine highlight worth being there for. It grounds CLOSURES and likely travel surges only — NOT measured tourist crowds, school-holiday timing or festivals. Some countries aren't covered, and Islamic holidays (Eid, Ramadan) are not in this source; the result flags both, so never imply a covered-but-empty country simply has no holidays. Call this only when the trip has a known month or dates (otherwise there's no window to check), once the cities are settled.",
+  input_schema: {
+    type: "object",
+    properties: {
+      cities: {
+        type: "array",
+        minItems: 1,
+        description: "Your cities to check for public holidays. Include each city's country.",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "City name." },
+            country: {
+              type: "string",
+              description: "Country (required to look up its public holidays).",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      targetMonth: {
+        type: "integer",
+        minimum: 1,
+        maximum: 12,
+        description:
+          "The calendar month the trip is for (1=January … 12=December), inferred from the brief. Omit only if the trip has no dates — but then don't call this tool at all.",
+      },
+    },
+    required: ["cities"],
+  } as Anthropic.Tool.InputSchema,
+};
+
 // The first tool that needs an API KEY (Duffel). The loop only offers it when DUFFEL_API_KEY is
-// set; without a key the app runs its keyless 5-tool self. origin is required — there's no sane
+// set; without a key the app runs its keyless 6-tool self. origin is required — there's no sane
 // default departure city — so when the brief gives none the prompt tells the model to skip flights
 // rather than guess.
 const FIND_FLIGHTS_TOOL: Anthropic.Tool = {
@@ -280,6 +317,7 @@ type PlanEvent =
         | "routing"
         | "pricing"
         | "timing"
+        | "holidays"
         | "flights"
         | "finalizing";
       done?: number;
@@ -354,6 +392,10 @@ function annotateItinerary(
   // The last find_flights result, if the agent ran one. We attach only a successful Duffel search;
   // an "unavailable" result (no key/origin/offers) attaches nothing, leaving the keyless app shape.
   flights: FlightResult | null,
+  // The last check_holidays result, if the agent ran one. recomputeHolidays filters it to the
+  // countries of the cities that survived to emit (and drops it when none were covered) — the same
+  // recompute-against-the-final-plan discipline the budget and season verdict follow.
+  holidays: HolidaySummary | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -465,11 +507,16 @@ function annotateItinerary(
   const flightsOut: FlightSummary | undefined =
     flights && flights.source === "duffel" ? flights : undefined;
 
+  // Recompute the holidays against the FINAL cities (drops countries the model cut after grounding,
+  // and the whole block when no surviving country was actually covered) — the budget/season recompute.
+  const holidaysOut = recomputeHolidays(holidays, cities) ?? undefined;
+
   return {
     ...itinerary,
     ...(budget ? { budget } : {}),
     ...(seasonOut ? { season: seasonOut } : {}),
     ...(flightsOut ? { flights: flightsOut } : {}),
+    ...(holidaysOut ? { holidays: holidaysOut } : {}),
     cities,
   };
 }
@@ -659,6 +706,7 @@ export async function POST(req: Request) {
       let routedOnce = false; // has the model used its one check_route round?
       let costedOnce = false; // has the model used its one estimate_costs round?
       let seasonedOnce = false; // has the model used its one best_time_to_go round?
+      let holidayedOnce = false; // has the model used its one check_holidays round?
       let flightedOnce = false; // has the model used its one find_flights round?
       // The bounded auto-repair round (parallel to flightedOnce): when round 1's verify turns up
       // places that don't exist, the loop withholds emit and FORCES one more verify so the model can
@@ -672,6 +720,8 @@ export async function POST(req: Request) {
       let costEstimate: CostEstimate | null = null;
       // The grounded seasonality from the last best_time_to_go call, attached to the final plan.
       let seasonEstimate: SeasonSummary | null = null;
+      // The grounded public holidays from the last check_holidays call, attached to the final plan.
+      let holidayEstimate: HolidaySummary | null = null;
       // The grounded flights from the last find_flights call (attached only when it's a successful
       // Duffel search; an "unavailable" result attaches nothing but still informs the model).
       let flightEstimate: FlightResult | null = null;
@@ -697,6 +747,7 @@ export async function POST(req: Request) {
             | "routing"
             | "pricing"
             | "timing"
+            | "holidays"
             | "flights"
             | "finalizing";
           let toolsForTurn: Anthropic.Tool[];
@@ -741,13 +792,23 @@ export async function POST(req: Request) {
             // gated on a Duffel key being configured — the keyed-tool gate; no key, never offered.
             if (!costedOnce && (!multiCity || routedOnce)) optional.push(ESTIMATE_COSTS_TOOL);
             if (!seasonedOnce && (!multiCity || routedOnce)) optional.push(BEST_TIME_TOOL);
+            // check_holidays grounds public-holiday closures once the cities are settled (like cost
+            // and timing). It's keyless, so it's offered in the no-Duffel app too. The model calls it
+            // only for a trip with a known month — the prompt steers that; a dateless trip just won't
+            // trigger it. Gated to one use via holidayedOnce, like every other optional tool.
+            if (!holidayedOnce && (!multiCity || routedOnce)) optional.push(CHECK_HOLIDAYS_TOOL);
             // find_flights goes last — only AFTER best_time_to_go has run (seasonedOnce), so the
             // fare is priced for the FINAL travel month, never one a later timing call would revise.
             // A trip worth pricing flights for names a month or dates, which the prompt routes
             // through best_time_to_go first, so flights still gets its turn; a dateless trip (where a
             // fare is barely meaningful) just won't trigger it. seasonedOnce also implies the route
             // was settled, so this inherits the cities-settled guarantee too.
-            if (flightsEnabled && !flightedOnce && seasonedOnce) optional.push(FIND_FLIGHTS_TOOL);
+            // Also gated on holidayedOnce: on an origin trip (emit withheld until flights run), this
+            // forces check_holidays to ground the closures BEFORE flights are priced, so the
+            // documented route -> timing -> holidays -> flights order holds at the loop level instead
+            // of being left to the model. holidayedOnce is always set by its handler, so no deadlock.
+            if (flightsEnabled && !flightedOnce && seasonedOnce && holidayedOnce)
+              optional.push(FIND_FLIGHTS_TOOL);
             if (optional.length > 0) {
               // Pre-decision label: name the work most likely to run next so the UI shows a
               // sensible phase before the model picks. Routing comes first on a multi-city trip;
@@ -760,11 +821,13 @@ export async function POST(req: Request) {
                     ? "pricing"
                     : !seasonedOnce
                       ? "timing"
-                      : "flights";
+                      : !holidayedOnce
+                        ? "holidays"
+                        : "flights";
               // When the traveler named an explicit departure city, pricing their flights is a
               // REQUIRED step (like verify_places), so withhold emit until find_flights has run —
               // the model can't finish without it. The gates above still enforce ORDER (route ->
-              // timing -> flights), so this only removes the early exit: a grounding tool is always
+              // timing -> holidays -> flights), so this only removes the early exit: a grounding tool is always
               // offered until flightedOnce, and find_flights' handler always sets flightedOnce (even
               // on an "unavailable" result), after which emit returns. No reorder, no deadlock.
               const owesFlights = flightsEnabled && hasOrigin && !flightedOnce;
@@ -859,6 +922,7 @@ export async function POST(req: Request) {
                 costEstimate,
                 seasonEstimate,
                 flightEstimate,
+                holidayEstimate,
               ),
             });
             return;
@@ -1172,6 +1236,66 @@ export async function POST(req: Request) {
             });
             seasonedOnce = true;
             continue; // back to the top — next turn the model prices/emits
+          }
+
+          if (toolUse.name === "check_holidays") {
+            const input = toolUse.input as { cities?: unknown; targetMonth?: unknown };
+            const targetMonth = parseTargetMonth(input.targetMonth);
+            // Same coercion as the other tools: pass an array through, recover a stringified one.
+            const rawCities = coerceArray(input.cities) as Array<{ name?: unknown; country?: unknown }>;
+            const cities = rawCities
+              .filter(
+                (c): c is { name: string; country?: unknown } =>
+                  !!c && typeof c.name === "string" && c.name.trim().length > 0,
+              )
+              .map((c) => ({
+                name: c.name.trim(),
+                country: typeof c.country === "string" ? c.country.trim() : undefined,
+              }));
+
+            // No checkable cities, or no travel month to anchor a year/window: consume the option
+            // (set holidayedOnce so the optional set still drains — the same always-set discipline
+            // every other *Once flag uses; skipping it could deadlock the owesFlights withhold) and
+            // move on WITHOUT holiday grounding rather than attach a vacuous one.
+            if (cities.length === 0 || targetMonth === null) {
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content:
+                      targetMonth === null
+                        ? "No travel month was given, so public holidays can't be checked. Emit the plan without holiday grounding."
+                        : "No valid cities were provided to check. Emit the plan without holiday grounding.",
+                  },
+                ],
+              });
+              holidayedOnce = true;
+              continue;
+            }
+
+            send({ type: "status", phase: "holidays" });
+            const holidays = await assessHolidays(
+              cities,
+              targetMonth,
+              new Date(),
+              (done, total, name) => send({ type: "status", phase: "holidays", done, total, name }),
+              req.signal,
+            );
+            holidayEstimate = holidays; // attached to the final plan as the grounded holidays
+            messages.push({
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify(holidayModelView(holidays)),
+                },
+              ],
+            });
+            holidayedOnce = true;
+            continue; // back to the top — next turn the model prices flights or emits
           }
 
           if (toolUse.name === "find_flights") {

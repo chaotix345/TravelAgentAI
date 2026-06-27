@@ -14,6 +14,8 @@ import type {
   SeasonSummary,
   CitySeasonSummary,
   SeasonLabel,
+  HolidaySummary,
+  CountryHolidays,
 } from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
 
@@ -43,6 +45,7 @@ type PlanEvent =
         | "routing"
         | "pricing"
         | "timing"
+        | "holidays"
         | "flights"
         | "finalizing";
       done?: number;
@@ -60,7 +63,7 @@ type Progress =
   | { phase: "drafting" | "finalizing" }
   | { phase: "verifying"; done: number; total: number }
   | {
-      phase: "routing" | "pricing" | "timing" | "regrounding";
+      phase: "routing" | "pricing" | "timing" | "holidays" | "regrounding";
       done: number;
       total: number;
       name?: string;
@@ -259,6 +262,7 @@ export default function Home() {
               evt.phase === "routing" ||
               evt.phase === "pricing" ||
               evt.phase === "timing" ||
+              evt.phase === "holidays" ||
               evt.phase === "regrounding"
             ) {
               // Heartbeats during the route/cost/timing/repair turn carry no counts — don't let them
@@ -534,15 +538,22 @@ function ProgressView({ progress }: { progress: Progress | null }) {
                       progress.name ? ` · ${progress.name}` : ""
                     }`
                   : "Checking the best time to go…"
-                : progress.phase === "flights"
-                  ? `Pricing flights…${progress.name ? ` · ${progress.name}` : ""}`
-                  : "Finalizing your itinerary…";
+                : progress.phase === "holidays"
+                  ? progress.total > 0
+                    ? `Checking public holidays… ${progress.done}/${progress.total} countries${
+                        progress.name ? ` · ${progress.name}` : ""
+                      }`
+                    : "Checking public holidays…"
+                  : progress.phase === "flights"
+                    ? `Pricing flights…${progress.name ? ` · ${progress.name}` : ""}`
+                    : "Finalizing your itinerary…";
 
   const pct =
     (progress?.phase === "verifying" ||
       progress?.phase === "routing" ||
       progress?.phase === "pricing" ||
       progress?.phase === "timing" ||
+      progress?.phase === "holidays" ||
       progress?.phase === "regrounding") &&
     progress.total > 0
       ? Math.round((progress.done / progress.total) * 100)
@@ -582,6 +593,7 @@ function Plan({
       {itinerary.budget && <BudgetBlock budget={itinerary.budget} />}
       {itinerary.flights && <FlightsBlock flights={itinerary.flights} />}
       {itinerary.season && <SeasonBlock season={itinerary.season} />}
+      {itinerary.holidays && <HolidaysBlock holidays={itinerary.holidays} />}
 
       {itinerary.cities.map((city, i) => (
         <article className="city" key={`${city.name}-${i}`}>
@@ -1138,6 +1150,95 @@ function CitySeason({
           </>
         )}
       </p>
+    </div>
+  );
+}
+
+// A short "14 Jul" from a YYYY-MM-DD, without a locale-dependent Date construction.
+function formatHolidayDate(iso: string): string {
+  const m = Number.parseInt(iso.slice(5, 7), 10);
+  const d = Number.parseInt(iso.slice(8, 10), 10);
+  return Number.isFinite(m) && Number.isFinite(d) && m >= 1 && m <= 12
+    ? `${d} ${MONTHS_FULL[m - 1].slice(0, 3)}`
+    : iso;
+}
+
+// The grounded public holidays, server-attached from the check_holidays tool. Trip-level block,
+// grouped by COUNTRY (holidays are national, not city-specific): the closures and long-weekend
+// surges that fall in the travel month, plus an honest coverage / Islamic-omission note. Like the
+// budget and season, the dates shown are the tool's, not the model's.
+function HolidaysBlock({ holidays }: { holidays: HolidaySummary }) {
+  const monthName = MONTHS_FULL[holidays.targetMonth - 1] ?? "";
+  const covered = holidays.countries.filter((c) => c.source === "nager");
+  const uncovered = holidays.countries.filter((c) => c.source === "none");
+  // Nothing covered → the server recompute would already have dropped the block; guard anyway.
+  if (covered.length === 0) return null;
+  return (
+    <div className="holidays">
+      <div className="holidays-head">
+        <span className="holidays-title">
+          Public holidays{monthName ? ` in ${monthName} ${holidays.year}` : ""}
+        </span>
+        <span
+          className="badge ok"
+          tabIndex={0}
+          title="Grounded in the Nager.Date public-holiday calendar — statutory closures, not crowd counts"
+        >
+          grounded
+        </span>
+      </div>
+      {covered.map((c) => (
+        <HolidayCountry key={c.iso2 ?? c.country} country={c} monthName={monthName} />
+      ))}
+      {uncovered.length > 0 && (
+        <p className="holiday-coverage">
+          No public-holiday data for {uncovered.map((c) => c.country).join(", ")}.
+        </p>
+      )}
+      <p className="holidays-note">
+        {holidays.note} {holidays.caveat}
+      </p>
+    </div>
+  );
+}
+
+function HolidayCountry({
+  country,
+  monthName,
+}: {
+  country: CountryHolidays;
+  monthName: string;
+}) {
+  return (
+    <div className="holiday-country">
+      <div className="holiday-country-name">{country.country}</div>
+      {country.holidays.length === 0 ? (
+        <p className="holiday-none">
+          No public holidays{monthName ? ` in ${monthName}` : ""} — no nationwide closures to plan
+          around.
+        </p>
+      ) : (
+        <ul className="holiday-list">
+          {country.holidays.map((h) => (
+            <li key={h.date} className={h.weekend ? "weekend" : ""}>
+              <span className="holiday-date">
+                {formatHolidayDate(h.date)} · {h.dayOfWeek}
+              </span>
+              <span className="holiday-name">
+                {h.name}
+                {h.localName && h.localName !== h.name ? ` · ${h.localName}` : ""}
+              </span>
+              {h.longWeekend && <span className="holiday-tag warn">long weekend</span>}
+              {h.weekend && <span className="holiday-tag muted">on a weekend</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {country.islamicCaveat && (
+        <p className="holiday-caveat">
+          Islamic holidays (Eid, Ramadan) are not in this data source — check local observances.
+        </p>
+      )}
     </div>
   );
 }
