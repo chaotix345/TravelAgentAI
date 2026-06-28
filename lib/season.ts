@@ -608,7 +608,7 @@ export function buildSeasonNote(cities: CitySeasonSummary[]): string {
       : ""
   }${
     haveUv
-      ? ` UV index is the typical daily midday peak (the monthly mean of each day's maximum UV, averaged across the observed mix of cloudy and clear days in the CAMS reanalysis, ${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a day with below-average cloud can run notably higher, and UV climbs with altitude, so a day trip from the city up to meaningfully higher terrain faces more than the city-base figure shown. It's modeled from reanalysis ozone, aerosols and cloud, not a live reading.`
+      ? ` UV index is the typical daily midday peak (the monthly mean of each day's maximum UV, averaged across the observed mix of cloudy and clear days in the Copernicus CAMS global model via Open-Meteo, ${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a day with below-average cloud can run notably higher, and UV climbs with altitude, so a day trip from the city up to meaningfully higher terrain faces more than the city-base figure shown. It's modeled from CAMS ozone, aerosols and cloud, not a live reading.`
       : ""
   }${
     haveAltitude
