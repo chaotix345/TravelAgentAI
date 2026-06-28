@@ -10,7 +10,7 @@ ask one or two quick questions first (only when they'd change the plan), then dr
 route and **grounds it in real data with five keyless tools** — it verifies the named places
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
-Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read and **air quality** (Open-Meteo ERA5 + Copernicus CAMS + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
+Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read, **air quality** and **altitude / acclimatization** (Open-Meteo ERA5 + Copernicus CAMS + terrain elevation + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
 one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
@@ -136,8 +136,8 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   genuinely comfortable (Reykjavik). Hemisphere needs no special-casing — labels come from the real
   numbers, so Sydney is correctly warm in January. Keyless and throttled like the geo tools, with a
   process-lifetime cache (normals barely change) and graceful degradation to "no data" on any
-  error. The thresholds are documented, tunable heuristics. Alongside the weather it grounds three more
-  per-month signals (the pure functions live in `lib/daylight.ts` and `lib/airheat.ts`):
+  error. The thresholds are documented, tunable heuristics. Alongside the weather it grounds four more
+  signals (the pure functions live in `lib/daylight.ts`, `lib/airheat.ts` and `lib/altitude.ts`):
   **daylight hours** — day length is a deterministic function of latitude and date, computed locally
   (pure astronomy via the NOAA sunrise equation — no network, no failure mode) from the lat the
   geocode already returned, with a per-city advisory ("~4h of daylight in December — front-load
@@ -146,9 +146,13 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   ~39°C — move sightseeing out of the midday heat"; and an **air-quality advisory** — a second
   keyless fetch pulls ~2 years of Copernicus CAMS PM2.5 normals on the coordinates already in hand,
   turned into a US-EPA AQI band server-side, so Delhi in November warns "typically unhealthy — bring
-  an N95". All three fold into the season pass with no new model turn (a fact a tool already has the
+  an N95"; and an **altitude / acclimatization advisory** — the same ERA5 response already carries the
+  city's terrain elevation, so a base at ~3,400m (Cusco) warns "take day 1 easy, hydrate, watch for
+  altitude sickness" and the model paces a gentle arrival day (the first *city-level*,
+  month-independent signal, so it attaches to the city, not each month). All four fold into the season
+  pass with no new model turn (a fact a tool already has the
   data for doesn't earn its own turn) and each degrades independently to nothing. It grounds
-  **weather, daylight, heat and air quality** only — there's no keyless source for tourist crowds —
+  **weather, daylight, heat, air quality and altitude** only — there's no keyless source for tourist crowds —
   and says so in a caveat.
 - **`lib/airheat.ts`** — the pure (zero-import, network-free) functions behind two of those signals:
   the "feels-like" **heat advisory** (CAUTION ≥ 37°C / DANGER ≥ 42°C on the ERA5 apparent-temperature
@@ -156,6 +160,13 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   **air-quality** band + advisory (US-EPA 2024 PM2.5 breakpoints, advisory at "unhealthy for sensitive
   groups" or worse). Like `lib/daylight.ts`, the thresholds live server-side so the model view and UI
   render one verdict; the network fetches stay in `lib/season.ts`.
+- **`lib/altitude.ts`** — the pure (zero-import, network-free) functions behind the **altitude /
+  acclimatization advisory**: it bands a city's base elevation into tiers (mild ~2,000m, acclimatize
+  ~2,500m, very high / serious risk ~3,500m) and writes a decisive, honest advisory (general travel
+  information, not medical advice; no drug names; HACE/HAPE glossed in plain language). The elevation is
+  the Copernicus GLO-90 figure that rides the **same** ERA5 archive response `lib/season.ts` already
+  fetches — so altitude costs no new request, the way daylight costs no network. It's the first
+  city-level (month-independent) signal, so it attaches to `CitySeasonSummary`, not `MonthSeason`.
 - **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
   The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
   *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)

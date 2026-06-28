@@ -1,6 +1,7 @@
 import { geocodeCity } from "./verify";
 import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./daylight";
 import { computeHeatAdvisory, aqiBandFor, aqiAdvisory, truncTenth } from "./airheat";
+import { computeAltitudeAdvisory } from "./altitude";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -132,8 +133,11 @@ export type SeasonCityInput = { name: string; country?: string };
 // geocode + fetch + scoring entirely. Mirrors verify.ts's cache, but module-scoped because the
 // data is request-independent (unlike the per-request verify cache).
 // NOTE: a long-running dev server caches each city ONCE per process lifetime, so after changing any
-// signal computed in classify() (daylight, heat, air quality) you must RESTART the server to flush
-// cities cached without the new fields — there is deliberately no programmatic invalidation.
+// signal computed in classify() (daylight, heat, air quality) OR assembled in assessSeason() on the
+// CitySeasonSummary (elevationM, altitudeAdvisory — the altitude signal) you must RESTART the server to
+// flush cities cached without the new fields — there is deliberately no programmatic invalidation
+// (the cache-read guard below force-refetches a pre-altitude entry as defense in depth, but a changed
+// THRESHOLD still needs a restart).
 const seasonCache = new Map<string, CitySeasonSummary>();
 const fold = (s: string) => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").trim().toLowerCase();
 const cacheKey = (name: string, country?: string) => `${fold(name)}|${fold(country ?? "")}`;
@@ -207,7 +211,7 @@ async function fetchNormals(
   lat: number,
   lon: number,
   signal?: AbortSignal,
-): Promise<MonthlyNormals | null> {
+): Promise<{ normals: MonthlyNormals; elevationM: number | null } | null> {
   const url =
     `${ARCHIVE}?latitude=${lat}&longitude=${lon}` +
     `&start_date=${START_DATE}&end_date=${END_DATE}` +
@@ -273,7 +277,19 @@ async function fetchNormals(
   // Apparent temperature is deliberately NOT in this guard — it's an advisory-only signal that
   // degrades to null per month, so its absence must never fail the whole city.
   if (acc.some((a) => a.tempN === 0 || a.maxN === 0 || a.precipN === 0)) return null;
-  return acc.map((a) => {
+  // Elevation is a TOP-LEVEL scalar in the ERA5 response (the Copernicus GLO-90 terrain model),
+  // independent of the daily arrays — so we read it AFTER the load-bearing climate null-guard above has
+  // already passed, and it never gates the climate data: an absent / non-finite / negative elevation
+  // degrades to null only (the apparent-temperature lesson — an optional field must stay out of the
+  // guard). Round to the nearest 10m HERE, once, so the stored figure and the advisory tier band on the
+  // same value (the daylight/heat raw-vs-rounded lesson). A negative value (an ocean grid cell, or a DEM
+  // no-data sentinel like -9999) is never a real city elevation → null.
+  const rawElev = (data as { elevation?: unknown }).elevation;
+  const elevationM =
+    typeof rawElev === "number" && Number.isFinite(rawElev) && rawElev >= 0
+      ? Math.round(rawElev / 10) * 10
+      : null;
+  const normals = acc.map((a) => {
     const years = Math.max(1, a.years.size);
     return {
       meanTempC: a.tempSum / a.tempN,
@@ -283,6 +299,7 @@ async function fetchNormals(
       meanApparentMaxC: a.atMaxN > 0 ? a.atMaxSum / a.atMaxN : null,
     };
   });
+  return { normals, elevationM };
 }
 
 // One geocoded city's typical monthly PM2.5 (µg/m³) from the CAMS global model via Open-Meteo's
@@ -352,7 +369,9 @@ async function fetchAirQualityNormals(
 // normals so it can attach the air advisory — both in the SAME place every other MonthSeason field
 // is built, which guarantees daylight, heat AND air-quality ride into the seasonCache with the rest
 // of the summary, never as a later mutation a cache hit would skip. Pure apart from its inputs — so
-// it's easy to test.
+// it's easy to test. NOTE altitude is NOT built here: it is a per-CITY (month-invariant) signal, so
+// it's assembled in assessSeason() on the CitySeasonSummary, not in these per-month records (see
+// lib/altitude.ts) — do not move it into classify() to "match the pattern" of daylight/heat/air.
 function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyNormals | null): {
   months: MonthSeason[];
   tropical: boolean;
@@ -550,12 +569,16 @@ export async function assessSeason(
 
     const key = cacheKey(name, country);
     const cached = seasonCache.get(key);
-    // Serve a cached city ONLY if it actually carries air-quality data. A city cached after a transient
-    // CAMS failure has all-null PM2.5 (the climate still succeeded, so source is "open-meteo" and it WAS
-    // cached) — skipping it here lets the air fetch retry on a later request instead of suppressing the
-    // air advisory for the whole process lifetime (the same "don't poison a retry" rule the catch below
-    // upholds). A genuinely CAMS-uncovered city re-fetches each time, which is rare and still correct.
-    if (cached && cached.months.some((m) => m.meanPm25 != null)) {
+    // Serve a cached city ONLY if it (a) was cached by altitude-AWARE code — the `"elevationM" in cached`
+    // key-existence check (NOT a value check: a legitimately sea-level/ocean city has elevationM === null
+    // but the KEY present) force-refetches an entry cached before the altitude fields existed, so a
+    // long-lived dev server can't serve a stale pre-altitude summary; and (b) actually carries
+    // air-quality data. A city cached after a transient CAMS failure has all-null PM2.5 (the climate
+    // still succeeded, so source is "open-meteo" and it WAS cached) — skipping it here lets the air fetch
+    // retry on a later request instead of suppressing the air advisory for the whole process lifetime
+    // (the same "don't poison a retry" rule the catch below upholds). A genuinely CAMS-uncovered city
+    // re-fetches each time, which is rare and still correct.
+    if (cached && "elevationM" in cached && cached.months.some((m) => m.meanPm25 != null)) {
       out.push(cached);
       onProgress?.(i + 1, cities.length, name);
       continue;
@@ -578,10 +601,23 @@ export async function assessSeason(
           fetchNormals(geo.lat, geo.lon, signal),
           fetchAirQualityNormals(geo.lat, geo.lon, signal),
         ]);
-        const normals = normalsRes.status === "fulfilled" ? normalsRes.value : null;
+        const normalsResult = normalsRes.status === "fulfilled" ? normalsRes.value : null;
         const aqiNormals = aqiRes.status === "fulfilled" ? aqiRes.value : null;
-        summary = normals
-          ? { name, country, geocoded: true, source: "open-meteo", ...classify(normals, geo.lat, aqiNormals) }
+        // Altitude is assembled HERE, on the CitySeasonSummary, not inside classify() (which stays
+        // per-month-only): elevation is month-invariant, so it's a city-level field. The 10m-rounded
+        // elevationM fetchNormals returned is BOTH stored and banded by computeAltitudeAdvisory, so the
+        // displayed figure and the advisory tier can't disagree.
+        const elevationM = normalsResult?.elevationM ?? null;
+        summary = normalsResult
+          ? {
+              name,
+              country,
+              geocoded: true,
+              source: "open-meteo",
+              ...classify(normalsResult.normals, geo.lat, aqiNormals),
+              elevationM,
+              altitudeAdvisory: computeAltitudeAdvisory(elevationM),
+            }
           : noData(name, country, true);
       }
     } catch {
@@ -612,10 +648,17 @@ export async function assessSeason(
   const haveAqi = out.some(
     (c) => c.source === "open-meteo" && c.months.some((m) => m.meanPm25 != null),
   );
+  // Only credit the elevation source when an altitude advisory actually fired — a plan of all-low cities
+  // carries elevationM values but shows no altitude line, so it shouldn't carry the disclosure.
+  const haveAltitude = out.some((c) => c.source === "open-meteo" && c.altitudeAdvisory != null);
   const note = haveData
     ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
         haveAqi
           ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
+          : ""
+      }${
+        haveAltitude
+          ? ` Elevation is from the Copernicus GLO-90 terrain model (via Open-Meteo), accurate to roughly ±100–150m for most cities — enough to gauge altitude, not a precise benchmark; acclimatization varies by person, fitness, and rate of ascent.`
           : ""
       }`
     : "Couldn't ground the season for these cities.";
@@ -639,6 +682,11 @@ function noData(name: string, country?: string, geocoded = false): CitySeasonSum
     challenging: false,
     months: [],
     bestWindow: "",
+    // Required fields (CitySeasonSummary declares them non-optional), so a noData city initializes both
+    // to null — which also makes a cache-hit on a pre-altitude entry a type error at the access site
+    // rather than a silent undefined.
+    elevationM: null,
+    altitudeAdvisory: null,
   };
 }
 
@@ -678,6 +726,12 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   const targetDaylight = targetCue((m) => m?.daylightAdvisory ?? null);
   const targetHeat = targetCue((m) => m?.heatAdvisory ?? null);
   const targetAir = targetCue((m) => m?.aqiAdvisory ?? null);
+  // Altitude heads-up is trip-level but city-NAMED (a vague "this trip is high" misattributes the day-1
+  // advice to the wrong city — the adversarial lens's positional-encoding catch). Built from `grounded`
+  // directly, NOT via targetCue, because altitude doesn't depend on a target month.
+  const altitudeHeadsUp = grounded
+    .filter((c) => c.altitudeAdvisory)
+    .map((c) => ({ city: c.name, elevationM: c.elevationM, advisory: c.altitudeAdvisory }));
   return {
     cities: summary.cities.map((c) => {
       if (c.source !== "open-meteo") return { name: c.name, data: false };
@@ -707,6 +761,10 @@ export function seasonModelView(summary: SeasonSummary): unknown {
         worst: ranked.slice(-2).map(monthBrief),
         ...(tm ? { targetMonth: targetBrief(c.months[tm - 1]) } : {}),
         ...(swing ? { daylightSwing: swing } : {}),
+        // Altitude rides OUTSIDE any tm-gated block — it's month-invariant, so the model must get it even
+        // for a dateless trip (the daylight render-gate lesson). The full advisory carries the day-1
+        // pacing instruction; elevationM lets the model cite the figure.
+        ...(c.altitudeAdvisory ? { altitudeAdvisory: c.altitudeAdvisory, elevationM: c.elevationM } : {}),
         ...(worstAir ? { worstAirMonth: `${MONTHS_SHORT[worstAir.month - 1]} (${worstAir.aqiBand})` } : {}),
         ...(worstHeat
           ? { worstHeatMonth: `${MONTHS_SHORT[worstHeat.month - 1]} (feels ~${worstHeat.meanApparentMaxC}°C)` }
@@ -735,6 +793,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
             .join(" ")}`,
         }
       : {}),
+    ...(altitudeHeadsUp.length > 0 ? { altitudeHeadsUp } : {}),
     note: summary.note,
     caveat: summary.caveat,
   };

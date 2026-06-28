@@ -1085,7 +1085,7 @@ function SeasonBlock({ season }: { season: SeasonSummary }) {
         <span
           className="badge ok"
           tabIndex={0}
-          title="Grounded in real climate, daylight, feels-like heat and air-quality data — not crowds"
+          title="Grounded in real climate, daylight, feels-like heat, air-quality and elevation data — not crowds"
         >
           grounded
         </span>
@@ -1166,6 +1166,12 @@ function CitySeason({
         {tm?.daylightAdvisory && <span className="daylight-note">{tm.daylightAdvisory}</span>}
         {tm?.heatAdvisory && <span className="heat-note">{tm.heatAdvisory}</span>}
         {tm?.aqiAdvisory && <span className="aqi-note">{tm.aqiAdvisory}</span>}
+        {/* Altitude renders UNCONDITIONALLY (NOT gated on tm) — it's month-invariant, so a dateless
+            high-city trip must still show it; gating it on a target month is the exact silent-drop bug
+            the daylight panel caught. It lives on the CitySeasonSummary (season), not a MonthSeason. */}
+        {season.altitudeAdvisory && (
+          <span className="altitude-note">{season.altitudeAdvisory}</span>
+        )}
       </p>
     </div>
   );

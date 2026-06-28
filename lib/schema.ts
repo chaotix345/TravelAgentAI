@@ -171,6 +171,21 @@ export type CitySeasonSummary = {
   challenging: boolean; // no genuinely comfortable month (we label the least-bad)
   months: MonthSeason[]; // length 12 (index 0 = January), or [] when source === "none"
   bestWindow: string; // headline "best months to go", e.g. "Best: Apr–Jun & Sep–Oct"
+  // The FIRST city-level (not per-month) signal: the city's BASE elevation in metres, from the
+  // Copernicus GLO-90 terrain model that rides the SAME ERA5 archive response best_time_to_go fetches
+  // (a top-level scalar — no new request). Rounded to the nearest 10m, the SAME value altitudeAdvisory
+  // is banded on, so the displayed figure and the advisory tier can never disagree (the daylight
+  // raw-vs-rounded lesson). null when the DEM is absent / non-finite / an ocean-or-sentinel negative.
+  // Required (non-optional) so noData() must initialize it — a cache-hit on a pre-altitude entry then
+  // surfaces as a type error at the access site rather than a silent undefined. Altitude is
+  // month-invariant, so it lives here, not on MonthSeason. See lib/altitude.ts.
+  elevationM: number | null;
+  // Server-computed acclimatization advisory when the base sits high enough to matter (mild ~2000m+,
+  // acclimatize ~2500m+, very high / serious risk ~3500m+), else null. General travel information, not
+  // medical advice; framed with "around" since the DEM is ±~100-150m. The threshold logic lives
+  // server-side (lib/altitude.ts) like daylight/heat/air; the UI prints this verbatim. Surfaces
+  // REGARDLESS of a target month (altitude doesn't depend on when you go).
+  altitudeAdvisory: string | null;
 };
 export type SeasonSummary = {
   cities: CitySeasonSummary[];
