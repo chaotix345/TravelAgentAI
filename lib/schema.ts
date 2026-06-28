@@ -124,6 +124,15 @@ export type MonthSeason = {
   temp: string; // descriptor, e.g. "warm"
   rain: string; // descriptor, e.g. "mostly dry"
   flags: string[]; // e.g. "rainy season — expect downpours"
+  // Sunrise-to-sunset day length (hours) for a representative mid-month day, computed from the
+  // city's latitude (lib/daylight.ts) — pure astronomy, not Open-Meteo data, so it's attributed
+  // separately in the season note. Raw value; formatted as "~Xh" at each display site.
+  daylightHours: number;
+  // Server-computed hemisphere-neutral planning advisory for this month's daylight ("~4h of
+  // daylight — front-load outdoor sightseeing…"), or null when daylight isn't a signal worth a line
+  // (the unremarkable 9-16h band, or an equatorial city). The threshold logic lives server-side so
+  // the model view and the UI render the same verdict; the UI prints this verbatim or omits it.
+  daylightAdvisory: string | null;
 };
 export type CitySeasonSummary = {
   name: string;

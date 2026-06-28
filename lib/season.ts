@@ -1,4 +1,5 @@
 import { geocodeCity } from "./verify";
+import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./daylight";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -246,8 +247,12 @@ async function fetchNormals(
 }
 
 // Turn 12 monthly normals into 12 scored, labelled MonthSeason records plus the tropical/
-// challenging flags and a best-window string. Pure function — no network — so it's easy to test.
-function classify(normals: MonthlyNormals): {
+// challenging flags and a best-window string. Takes the city's latitude so it can attach each
+// month's daylight hours + advisory (pure astronomy, no network) in the SAME place every other
+// MonthSeason field is built — which guarantees the daylight rides into the seasonCache with the
+// rest of the summary, not as a later mutation a cache hit would skip. Pure function — no network
+// — so it's easy to test.
+function classify(normals: MonthlyNormals, lat: number): {
   months: MonthSeason[];
   tropical: boolean;
   challenging: boolean;
@@ -297,6 +302,8 @@ function classify(normals: MonthlyNormals): {
       temp: tempDescriptor(n.meanMaxC),
       rain: precipDescriptor(n.rainDays),
       flags,
+      daylightHours: computeDaylightHours(lat, i + 1),
+      daylightAdvisory: daylightAdvisory(lat, i + 1),
     };
   });
 
@@ -440,7 +447,7 @@ export async function assessSeason(
       } else {
         const normals = await fetchNormals(geo.lat, geo.lon, signal);
         summary = normals
-          ? { name, country, geocoded: true, source: "open-meteo", ...classify(normals) }
+          ? { name, country, geocoded: true, source: "open-meteo", ...classify(normals, geo.lat) }
           : noData(name, country, true);
       }
     } catch {
@@ -464,7 +471,7 @@ export async function assessSeason(
 
   const haveData = out.some((c) => c.source === "open-meteo");
   const note = haveData
-    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds.`
+    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.`
     : "Couldn't ground the season for these cities.";
 
   return {
@@ -495,10 +502,32 @@ function noData(name: string, country?: string, geocoded = false): CitySeasonSum
 export function seasonModelView(summary: SeasonSummary): unknown {
   const monthBrief = (m: MonthSeason) =>
     `${MONTHS_SHORT[m.month - 1]} ${LABEL_WORD[m.label]} (${m.temp}, ${m.meanMaxC}°C, ${m.rain})`;
+  // The target month additionally carries its daylight advisory INLINE, so the model adapts the day
+  // structure (front-load outdoor plans / use long evenings) instead of inferring it from a raw hour
+  // count. best/worst months stay weather-only — a daylight figure on each would be token noise the
+  // model can't act on for an unremarkable shoulder month.
+  const targetBrief = (m: MonthSeason) =>
+    m.daylightAdvisory ? `${monthBrief(m)}; ${m.daylightAdvisory}` : monthBrief(m);
+  const tm = summary.targetMonth;
+  const grounded = summary.cities.filter((c) => c.source === "open-meteo");
+  // Trip-level daylight headline for the target month — the advisories of the grounded cities whose
+  // target month is notable, mirroring targetAssessment. Model-view ONLY (the UI keeps daylight
+  // per-city in CitySeason, since a mixed-latitude trip can't share one daylight line); gives the
+  // model a one-line cue to lead with.
+  const targetDaylight =
+    tm != null
+      ? grounded
+          .map((c) => ({ name: c.name, adv: c.months[tm - 1]?.daylightAdvisory }))
+          .filter((x): x is { name: string; adv: string } => !!x.adv)
+      : [];
   return {
     cities: summary.cities.map((c) => {
       if (c.source !== "open-meteo") return { name: c.name, data: false };
       const ranked = [...c.months].sort((a, b) => b.comfort - a.comfort);
+      // With no target month there's no single value to advise on, but a large yearlong swing (a
+      // high-latitude city) is itself the reason to time the trip — hand the model that swing so it
+      // can steer the best window. Small-swing cities omit it (the best-window string implies it).
+      const swing = tm == null ? daylightSwing(c.months.map((m) => m.daylightHours)) : null;
       return {
         name: c.name,
         tropical: c.tropical || undefined,
@@ -506,12 +535,18 @@ export function seasonModelView(summary: SeasonSummary): unknown {
         bestWindow: c.bestWindow,
         best: ranked.slice(0, 3).map(monthBrief),
         worst: ranked.slice(-2).map(monthBrief),
-        ...(summary.targetMonth
-          ? { targetMonth: monthBrief(c.months[summary.targetMonth - 1]) }
-          : {}),
+        ...(tm ? { targetMonth: targetBrief(c.months[tm - 1]) } : {}),
+        ...(swing ? { daylightSwing: swing } : {}),
       };
     }),
     targetAssessment: summary.targetAssessment ?? undefined,
+    ...(targetDaylight.length > 0
+      ? {
+          targetDaylightAdvisory: `${MONTHS[tm! - 1]} daylight — ${targetDaylight
+            .map((x) => `${x.name}: ${x.adv}`)
+            .join(" ")}`,
+        }
+      : {}),
     note: summary.note,
     caveat: summary.caveat,
   };
