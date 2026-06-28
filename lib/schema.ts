@@ -133,6 +133,33 @@ export type MonthSeason = {
   // (the unremarkable 9-16h band, or an equatorial city). The threshold logic lives server-side so
   // the model view and the UI render the same verdict; the UI prints this verbatim or omits it.
   daylightAdvisory: string | null;
+  // "Feels-like" afternoon high (°C): the monthly mean of ERA5 daily APPARENT-temperature highs,
+  // which fold humidity, wind and solar radiation into the dry-bulb temperature. It rides the SAME
+  // ERA5 archive fetch the comfort score uses (just one more daily field) — so, like daylight, it's
+  // a derived signal computed server-side, never the model's claim. null when ERA5 didn't return
+  // the field (degrades independently — it never nulls out the whole city's season). Rounded for
+  // display, like meanMaxC.
+  meanApparentMaxC: number | null;
+  // Server-computed heat advisory when the feels-like high is genuinely taxing — CAUTION at ~37°C+,
+  // DANGER at ~42°C+ (bands on the ROUNDED feels-like, so the advisory's cited figure always matches
+  // the displayed one — the daylight raw-vs-rounded lesson). null below ~37°C. Advisory-only: it
+  // NEVER adjusts the comfort score or label (the comfort score already penalises dry heat from the
+  // dry-bulb temperature; this catches the humidity load that the dry-bulb misses, e.g. Bangkok).
+  heatAdvisory: string | null;
+  // Typical monthly PM2.5 concentration (µg/m³) from the Copernicus CAMS global model via Open-Meteo,
+  // averaged over ~2 recent years. A monthly NORMAL, not a live reading — and a coarse global model
+  // can understate short, localised pollution spikes (crop-burning season). null when CAMS has no
+  // data for this city/month. Rounded for display.
+  meanPm25: number | null;
+  // US EPA (2024) AQI category computed SERVER-SIDE from meanPm25 ("Good" | "Moderate" | "Unhealthy
+  // for Sensitive Groups" | "Unhealthy" | "Very Unhealthy" | "Hazardous"), or null when no PM2.5
+  // data. Computed from the raw concentration (not a provider index field, which can be absent or use
+  // pre-2024 breakpoints) so the band always exists when the concentration does.
+  aqiBand: string | null;
+  // Server-computed air-quality advisory when aqiBand is "Unhealthy for Sensitive Groups" or worse,
+  // null for Good/Moderate (Moderate doesn't warrant a traveler warning). Framed as a typical
+  // monthly normal, not a live 24-hour reading. Like daylight/heat, the threshold lives server-side.
+  aqiAdvisory: string | null;
 };
 export type CitySeasonSummary = {
   name: string;
