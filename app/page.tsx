@@ -1085,7 +1085,9 @@ function SeasonBlock({ season }: { season: SeasonSummary }) {
         <span
           className="badge ok"
           tabIndex={0}
-          title="Grounded in real climate, daylight, feels-like heat, air-quality and elevation data — not crowds"
+          title={`Grounded in real climate, daylight, feels-like heat, air-quality${
+            season.cities.some((c) => c.altitudeAdvisory != null) ? " and elevation data" : ""
+          } — not crowds`}
         >
           grounded
         </span>

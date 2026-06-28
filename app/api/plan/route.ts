@@ -16,7 +16,7 @@ import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, currencyClause } from "@/
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute, buildRouteSummary, type StoredRouteMatrix } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
-import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
+import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth, buildSeasonNote } from "@/lib/season";
 import { assessHolidays, holidayModelView, recomputeHolidays } from "@/lib/holidays";
 import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
 import { homeCurrency, getRate, applyFxToCost, applyFxToFlights, costModelView } from "@/lib/currency";
@@ -501,7 +501,11 @@ function annotateItinerary(
       targetAssessment: season.targetMonth
         ? seasonTargetLine(matchedSeason, season.targetMonth)
         : null,
-      note: season.note,
+      // Recompute the note against the FINAL emitted cities (not the full assessed set), so a source
+      // disclosure — elevation, feels-like heat, CAMS air quality — is credited only when that signal
+      // actually survives to the plan, the same recompute-against-the-plan discipline targetAssessment
+      // follows just above. (Fixes a stale disclosure when the model drops the only high/hot/polluted city.)
+      note: buildSeasonNote(matchedSeason),
       caveat: season.caveat,
     };
   }

@@ -1,7 +1,7 @@
 import { geocodeCity } from "./verify";
 import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./daylight";
 import { computeHeatAdvisory, aqiBandFor, aqiAdvisory, truncTenth } from "./airheat";
-import { computeAltitudeAdvisory } from "./altitude";
+import { computeAltitudeAdvisory, altitudeTier } from "./altitude";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -542,6 +542,32 @@ function targetAssessment(cities: CitySeasonSummary[], targetMonth: number): str
 // Public entry point — executes the best_time_to_go tool. Mirrors estimateCosts: filter inputs,
 // loop cities (throttled, abortable, capped), degrade gracefully, stream progress, attach a
 // trip-level note + caveat. Returns the full SeasonSummary the server attaches to the plan.
+// Build the data-source note from a city set. Exported and taken as a PARAMETER (not closed over the
+// full assessed list) so the route can RECOMPUTE it against the FINAL emitted cities — the same
+// recompute-against-the-plan discipline targetAssessment follows. Each source clause is gated on that
+// signal actually landing in THIS set, so a plan that dropped its only high-altitude (or hot, or
+// polluted) city after assessment doesn't credit a source nothing visible uses.
+export function buildSeasonNote(cities: CitySeasonSummary[]): string {
+  const haveData = cities.some((c) => c.source === "open-meteo");
+  if (!haveData) return "Couldn't ground the season for these cities.";
+  const haveHeat = cities.some(
+    (c) => c.source === "open-meteo" && c.months.some((m) => m.meanApparentMaxC != null),
+  );
+  const haveAqi = cities.some(
+    (c) => c.source === "open-meteo" && c.months.some((m) => m.meanPm25 != null),
+  );
+  const haveAltitude = cities.some((c) => c.source === "open-meteo" && c.altitudeAdvisory != null);
+  return `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
+    haveAqi
+      ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
+      : ""
+  }${
+    haveAltitude
+      ? ` Elevation is from the Copernicus GLO-90 terrain model (via Open-Meteo), accurate to roughly ±100–150m for most cities — enough to gauge altitude, not a precise benchmark; acclimatization varies by person, fitness, and rate of ascent.`
+      : ""
+  }`;
+}
+
 export async function assessSeason(
   rawCities: SeasonCityInput[],
   targetMonth: number | null,
@@ -639,29 +665,10 @@ export async function assessSeason(
     if (signal?.aborted) break;
   }
 
-  const haveData = out.some((c) => c.source === "open-meteo");
-  // CAMS attribution is a CC-BY 4.0 requirement, but only when air-quality data actually landed —
-  // a plan whose cities all came back without PM2.5 shouldn't credit a source it didn't use.
-  const haveHeat = out.some(
-    (c) => c.source === "open-meteo" && c.months.some((m) => m.meanApparentMaxC != null),
-  );
-  const haveAqi = out.some(
-    (c) => c.source === "open-meteo" && c.months.some((m) => m.meanPm25 != null),
-  );
-  // Only credit the elevation source when an altitude advisory actually fired — a plan of all-low cities
-  // carries elevationM values but shows no altitude line, so it shouldn't carry the disclosure.
-  const haveAltitude = out.some((c) => c.source === "open-meteo" && c.altitudeAdvisory != null);
-  const note = haveData
-    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
-        haveAqi
-          ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
-          : ""
-      }${
-        haveAltitude
-          ? ` Elevation is from the Copernicus GLO-90 terrain model (via Open-Meteo), accurate to roughly ±100–150m for most cities — enough to gauge altitude, not a precise benchmark; acclimatization varies by person, fitness, and rate of ascent.`
-          : ""
-      }`
-    : "Couldn't ground the season for these cities.";
+  // Recomputed below against the FINAL emitted cities in the route, but built here over every assessed
+  // city for the model's tool_result. The helper gates each source disclosure on that signal actually
+  // landing, so an all-low-altitude (or all-cool, or clean-air) plan doesn't credit a source it didn't use.
+  const note = buildSeasonNote(out);
 
   return {
     cities: out,
@@ -730,8 +737,16 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   // advice to the wrong city — the adversarial lens's positional-encoding catch). Built from `grounded`
   // directly, NOT via targetCue, because altitude doesn't depend on a target month.
   const altitudeHeadsUp = grounded
-    .filter((c) => c.altitudeAdvisory)
-    .map((c) => ({ city: c.name, elevationM: c.elevationM, advisory: c.altitudeAdvisory }));
+    // Type-predicate filter narrows BOTH altitudeAdvisory and elevationM to non-null (the invariant
+    // computeAltitudeAdvisory enforces: a non-null advisory implies a non-null elevation).
+    .filter(
+      (c): c is CitySeasonSummary & { elevationM: number; altitudeAdvisory: string } =>
+        c.altitudeAdvisory != null,
+    )
+    // A COMPACT, city-NAMED cue (city + elevation + tier) — NOT a re-copy of the full advisory, which
+    // the per-city block already carries; its only job is positional disambiguation (which city is high)
+    // so a mixed-elevation trip can't misattribute the day-1 advice. Mirrors the other compact trip cues.
+    .map((c) => ({ city: c.name, elevationM: c.elevationM, tier: altitudeTier(c.elevationM) }));
   return {
     cities: summary.cities.map((c) => {
       if (c.source !== "open-meteo") return { name: c.name, data: false };

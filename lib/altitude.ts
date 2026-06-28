@@ -88,6 +88,6 @@ export function computeAltitudeAdvisory(elevationM: number | null): string | nul
   return (
     `At ${m}, this is mild altitude — some travelers notice a little breathlessness on exertion or sleep ` +
     `less soundly the first night or two. Ease into the first day, stay well hydrated, and go easy on ` +
-    `alcohol at first; most healthy travelers adjust within a day.`
+    `alcohol at first; most healthy travelers adjust within a day. This is general travel information, not personal medical advice.`
   );
 }
