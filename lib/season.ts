@@ -1,6 +1,6 @@
 import { geocodeCity } from "./verify";
 import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./daylight";
-import { computeHeatAdvisory, aqiBandFor, aqiAdvisory } from "./airheat";
+import { computeHeatAdvisory, aqiBandFor, aqiAdvisory, truncTenth } from "./airheat";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -61,11 +61,13 @@ const END_DATE = "2024-12-31";
 // whose history only begins in ~Aug 2022 — so it gets its OWN window (never reuse START_DATE, which
 // would request 2+ years of empty rows before coverage starts). Two clean full years is the practical
 // max and keeps a stable cache key. The hourly PM2.5 payload is ~20× the daily climate one, so it
-// gets a longer timeout and runs in parallel with the climate fetch (it never blocks it).
+// runs in parallel with the climate fetch. Its timeout is capped at the climate timeout (8s), NOT
+// higher: Promise.allSettled waits for BOTH fetches, so a longer CAMS timeout would just make a slow
+// CAMS response the binding per-city wall-clock. A CAMS timeout degrades air quality to null at no cost.
 const AQ_ENDPOINT = "https://air-quality-api.open-meteo.com/v1/air-quality";
 const AQ_START_DATE = "2023-01-01";
 const AQ_END_DATE = "2024-12-31";
-const AQ_TIMEOUT_MS = 12000;
+const AQ_TIMEOUT_MS = 8000;
 
 // --- Comfort model (tunable heuristics, like cost.ts's tier cutoffs / route.ts's distances) ---
 // The whole verdict turns on these. They were calibrated against known cases (Seville is brutal
@@ -397,8 +399,12 @@ function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyN
     // penalises raw heat from the dry-bulb high). The feels-like is rounded so its advisory's cited
     // figure matches the displayed value (the daylight raw-vs-rounded lesson).
     const apparentMax = n.meanApparentMaxC != null ? Math.round(n.meanApparentMaxC) : null;
+    // Truncate PM2.5 to 0.1 µg/m³ ONCE and use that single value for BOTH the band and the stored
+    // display figure, so the tooltip's "~X µg/m³" can never disagree with its band (the heat path's
+    // round-once discipline, applied to air). aqiBandFor re-truncates idempotently.
     const meanPm25Raw = aqiNormals?.[i]?.meanPm25 ?? null;
-    const band = aqiBandFor(meanPm25Raw);
+    const meanPm25 = meanPm25Raw != null ? truncTenth(meanPm25Raw) : null;
+    const band = aqiBandFor(meanPm25);
     return {
       month: i + 1,
       label: labelFor(i),
@@ -414,7 +420,7 @@ function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyN
       daylightAdvisory: daylightAdvisory(lat, i + 1),
       meanApparentMaxC: apparentMax,
       heatAdvisory: computeHeatAdvisory(apparentMax),
-      meanPm25: meanPm25Raw != null ? Math.round(meanPm25Raw) : null,
+      meanPm25,
       aqiBand: band,
       aqiAdvisory: aqiAdvisory(band),
     };
@@ -544,7 +550,12 @@ export async function assessSeason(
 
     const key = cacheKey(name, country);
     const cached = seasonCache.get(key);
-    if (cached) {
+    // Serve a cached city ONLY if it actually carries air-quality data. A city cached after a transient
+    // CAMS failure has all-null PM2.5 (the climate still succeeded, so source is "open-meteo" and it WAS
+    // cached) — skipping it here lets the air fetch retry on a later request instead of suppressing the
+    // air advisory for the whole process lifetime (the same "don't poison a retry" rule the catch below
+    // upholds). A genuinely CAMS-uncovered city re-fetches each time, which is rare and still correct.
+    if (cached && cached.months.some((m) => m.meanPm25 != null)) {
       out.push(cached);
       onProgress?.(i + 1, cities.length, name);
       continue;
@@ -595,11 +606,14 @@ export async function assessSeason(
   const haveData = out.some((c) => c.source === "open-meteo");
   // CAMS attribution is a CC-BY 4.0 requirement, but only when air-quality data actually landed —
   // a plan whose cities all came back without PM2.5 shouldn't credit a source it didn't use.
+  const haveHeat = out.some(
+    (c) => c.source === "open-meteo" && c.months.some((m) => m.meanApparentMaxC != null),
+  );
   const haveAqi = out.some(
     (c) => c.source === "open-meteo" && c.months.some((m) => m.meanPm25 != null),
   );
   const note = haveData
-    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them. "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.${
+    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
         haveAqi
           ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
           : ""

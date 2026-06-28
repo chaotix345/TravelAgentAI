@@ -149,7 +149,8 @@ export type MonthSeason = {
   // Typical monthly PM2.5 concentration (µg/m³) from the Copernicus CAMS global model via Open-Meteo,
   // averaged over ~2 recent years. A monthly NORMAL, not a live reading — and a coarse global model
   // can understate short, localised pollution spikes (crop-burning season). null when CAMS has no
-  // data for this city/month. Rounded for display.
+  // data for this city/month. Truncated to 0.1 µg/m³ for display, the SAME value aqiBand is computed
+  // from, so the displayed figure and the band can never disagree.
   meanPm25: number | null;
   // US EPA (2024) AQI category computed SERVER-SIDE from meanPm25 ("Good" | "Moderate" | "Unhealthy
   // for Sensitive Groups" | "Unhealthy" | "Very Unhealthy" | "Hazardous"), or null when no PM2.5

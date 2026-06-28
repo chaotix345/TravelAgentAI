@@ -61,11 +61,16 @@ export type AqiBand =
 
 // EPA Technical Assistance Document: the AQI is computed on the concentration TRUNCATED to 0.1 µg/m³,
 // not rounded — so 9.05 is treated as 9.0 (Good), not 9.1 (Moderate). Caller guarantees x >= 0, so
-// floor == truncate-toward-zero here. The +1e-9 nudge absorbs IEEE-754 representation error: 9.1 is
-// stored as 9.0999999996, so a bare floor(9.1 * 10) gives 90 → 9.0, mis-banding a value that sits
-// exactly on a 0.1 breakpoint DOWNWARD. The epsilon is far below any real 0.1 step, so it only
-// corrects float noise, never a genuine value.
-function truncTenth(x: number): number {
+// floor == truncate-toward-zero here. The +1e-9 nudge absorbs IEEE-754 representation error: when a
+// computed monthly mean's product x*10 lands a hair below an integer (e.g. an averaged 354.0 that
+// represents as 353.99999999998), a bare floor would drop it a whole 0.1 band — the nudge restores
+// the correct truncation. (9.1 itself is safe: 9.1*10 evaluates to exactly 91.0, so it is NOT the
+// motivating case; the epsilon guards against analogous float noise at other 0.1 breakpoints.) 1e-9
+// is far below any real 0.1 step, so it only corrects float noise, never a genuine value. Exported so
+// lib/season.ts can store the SAME 0.1-truncated value it displays as the one aqiBandFor bands on —
+// otherwise an integer-rounded display could read "Moderate (~9 µg/m³)" (the daylight raw-vs-rounded
+// lesson, applied to PM2.5).
+export function truncTenth(x: number): number {
   return Math.floor(x * 10 + 1e-9) / 10;
 }
 

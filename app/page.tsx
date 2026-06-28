@@ -1146,9 +1146,7 @@ function CitySeason({
             }${
               m.heatAdvisory && m.meanApparentMaxC != null ? ` · feels like ~${m.meanApparentMaxC}°C` : ""
             }${
-              m.aqiBand
-                ? ` · air: ${m.aqiBand}${m.meanPm25 != null ? ` (~${m.meanPm25} µg/m³ PM2.5)` : ""}`
-                : ""
+              m.aqiAdvisory ? ` · air: ${m.aqiBand} (~${m.meanPm25} µg/m³ PM2.5)` : ""
             }`}
           >
             {MONTH_INITIALS[m.month - 1]}
