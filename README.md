@@ -10,7 +10,7 @@ ask one or two quick questions first (only when they'd change the plan), then dr
 route and **grounds it in real data with five keyless tools** — it verifies the named places
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
-Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read, **air quality** and **altitude / acclimatization** (Open-Meteo ERA5 + Copernicus CAMS + terrain elevation + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
+Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read, **air quality**, **UV / sun-safety** and **altitude / acclimatization** (Open-Meteo ERA5 + Copernicus CAMS + terrain elevation + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
 one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
@@ -149,10 +149,14 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   an N95"; and an **altitude / acclimatization advisory** — the same ERA5 response already carries the
   city's terrain elevation, so a base at ~3,400m (Cusco) warns "take day 1 easy, hydrate, watch for
   altitude sickness" and the model paces a gentle arrival day (the first *city-level*,
-  month-independent signal, so it attaches to the city, not each month). All four fold into the season
+  month-independent signal, so it attaches to the city, not each month); and a **UV / sun-safety
+  advisory** — the SAME Copernicus CAMS fetch that returns PM2.5 also returns the hourly UV index, folded
+  to each month's typical midday peak, so a high-altitude tropical base like Cusco (UV ~11 year-round)
+  warns "SPF50+, a hat, and stay out of the midday sun" while an ordinary temperate summer stays silent.
+  All five fold into the season
   pass with no new model turn (a fact a tool already has the
   data for doesn't earn its own turn) and each degrades independently to nothing. It grounds
-  **weather, daylight, heat, air quality and altitude** only — there's no keyless source for tourist crowds —
+  **weather, daylight, heat, air quality, UV and altitude** only — there's no keyless source for tourist crowds —
   and says so in a caveat.
 - **`lib/airheat.ts`** — the pure (zero-import, network-free) functions behind two of those signals:
   the "feels-like" **heat advisory** (CAUTION ≥ 37°C / DANGER ≥ 42°C on the ERA5 apparent-temperature
@@ -167,6 +171,15 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   the Copernicus GLO-90 figure that rides the **same** ERA5 archive response `lib/season.ts` already
   fetches — so altitude costs no new request, the way daylight costs no network. It's the first
   city-level (month-independent) signal, so it attaches to `CitySeasonSummary`, not `MonthSeason`.
+- **`lib/uv.ts`** — the pure (zero-import, network-free) functions behind the **UV / sun-safety
+  advisory**: it bands a month's typical midday UV index into the WHO categories (Low / Moderate / High /
+  Very High / Extreme) and writes a decisive advisory — fired at UV ≥ 9 (a notch above the WHO "Very High"
+  floor of 8, so an ordinary Mediterranean-summer UV ~8 stays silent, matching the heat/air "only warn
+  when it changes the day" calibration) and again at "Extreme" (≥ 11). The UV index rides the **same**
+  Copernicus CAMS air-quality fetch `lib/season.ts` already makes for PM2.5 (one extra hourly field, no new
+  request), folded hourly → daily **max** (the midday peak, never a night-dragged 24h mean) → monthly mean.
+  General sun-safety travel info with no skin-type-specific burn-time claims; the threshold lives
+  server-side like the rest.
 - **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
   The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
   *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)
@@ -323,9 +336,9 @@ heat, 37 °C") so the agent can warn the traveler and suggest a better window, o
 (early starts, shaded afternoons, rain backups). Like the budget, the **displayed seasonality is
 server-attached** (`annotateItinerary`, with the target-month verdict recomputed from the final
 cities), never the model's claim. It now also grounds **daylight hours, a "feels-like" heat read,
-and air quality** per month (computed from the same geocode/fetch, server-side, with no extra model
+air quality and UV / sun-safety** per month (computed from the same geocode/fetch, server-side, with no extra model
 turn) — but still no tourist crowds (no keyless source), so a caveat says a weather-mild month can
-still be the busiest, and the air-quality figure is flagged as a monthly normal, not a live reading.
+still be the busiest, and the air-quality and UV figures are flagged as monthly normals, not live readings.
 
 ## Grounding the flights (the first keyed tool)
 
@@ -467,10 +480,11 @@ small decision, not the planning).
    model's prose so nothing shows `$` next to `£`.
 10. ✅ **More grounding since — done.** Further milestones followed the same server-attached pattern:
     a bounded auto-repair verify round, booking-ready flight detail + smart flight selection, **public
-    holidays** (Nager.Date), real **road travel times** between cities (OSRM), **daylight hours**, and a
-    **"feels-like" heat + air-quality** pass — all folded into `best_time_to_go` as deterministic
+    holidays** (Nager.Date), real **road travel times** between cities (OSRM), **daylight hours**, a
+    **"feels-like" heat + air-quality** pass, **altitude / acclimatization**, and a **UV / sun-safety**
+    read — all folded into `best_time_to_go` as deterministic
     enrichments (no new tool, no extra model turn), so a December plan in Reykjavik front-loads outdoor
-    sightseeing around ~4h of light, Dubai in August warns of ~45°C feels-like heat, and Delhi in
-    November flags typically unhealthy air with an N95 nudge.
+    sightseeing around ~4h of light, Dubai in August warns of ~45°C feels-like heat, Delhi in
+    November flags typically unhealthy air with an N95 nudge, and Cusco warns of year-round extreme UV.
 11. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
     agent.

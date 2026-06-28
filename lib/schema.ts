@@ -161,6 +161,22 @@ export type MonthSeason = {
   // null for Good/Moderate (Moderate doesn't warrant a traveler warning). Framed as a typical
   // monthly normal, not a live 24-hour reading. Like daylight/heat, the threshold lives server-side.
   aqiAdvisory: string | null;
+  // The typical midday-peak UV index for this month: the monthly mean of each day's MAXIMUM hourly UV
+  // (the noon peak — a 24h average would be dragged to ~0 by the night hours). From the SAME Copernicus
+  // CAMS fetch as meanPm25 (one extra hourly field, no new request), rounded to a whole WHO UV index.
+  // null when CAMS returned no UV for this city/month (degrades independently, like meanPm25). The band
+  // and advisory are computed from this one rounded value, so the displayed figure and its band agree.
+  uvIndex: number | null;
+  // The WHO Global Solar UV Index category computed SERVER-SIDE from uvIndex ("Low" | "Moderate" |
+  // "High" | "Very High" | "Extreme"), or null when no UV data. Stored for every month; the UI shows the
+  // label only when the advisory fires (a bare "Very High" with no advisory line reads as a silent alarm).
+  uvBand: string | null;
+  // Server-computed sun-safety advisory when the typical midday UV is genuinely strong — fires at UV >= 9
+  // (a notch above the WHO "Very High" floor of 8, so an ordinary Mediterranean-summer UV ~8 stays silent,
+  // matching the heat/air "only warn when it changes the day" calibration) and again at "Extreme" (>= 11).
+  // null below the floor. Advisory-only: it NEVER touches the comfort score or label (a cool place can have
+  // brutal UV — high-altitude tropics, spring snow-glare). The threshold + wording live in lib/uv.ts.
+  uvAdvisory: string | null;
 };
 export type CitySeasonSummary = {
   name: string;

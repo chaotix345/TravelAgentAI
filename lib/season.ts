@@ -2,6 +2,7 @@ import { geocodeCity } from "./verify";
 import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./daylight";
 import { computeHeatAdvisory, aqiBandFor, aqiAdvisory, truncTenth } from "./airheat";
 import { computeAltitudeAdvisory, altitudeTier } from "./altitude";
+import { uvBandFor, uvAdvisory } from "./uv";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -23,12 +24,12 @@ import type {
 //   3. Score each month for traveler comfort (temperature + dryness), label it peak / shoulder
 //      / off, and derive a "best months to go" window plus a verdict on the trip's target month.
 //
-// On top of the weather comfort, classify() folds in THREE derived signals computed from data the
+// On top of the weather comfort, classify() folds in FOUR derived signals computed from data the
 // same geocode/fetch already produced — daylight hours (pure astronomy from the latitude, lib/
 // daylight.ts), the "feels like" heat advisory (from an apparent-temperature field on the SAME ERA5
-// fetch), and an air-quality advisory (from a second keyless CAMS fetch on the same coordinates,
-// lib/airheat.ts). None is a model tool: a fact derivable from data a tool already gathered doesn't
-// earn its own model turn (the FX / booking-enrich / daylight precedent).
+// fetch), and an air-quality advisory PLUS a UV / sun-safety advisory (both from ONE keyless CAMS fetch
+// on the same coordinates — lib/airheat.ts and lib/uv.ts). None is a model tool: a fact derivable from
+// data a tool already gathered doesn't earn its own model turn (the FX / booking-enrich / daylight precedent).
 //
 // Like the verify verdict and the budget, what the UI shows is OURS (server-computed here),
 // never a claim the model made. The model reads a trimmed view (seasonModelView) to time the
@@ -133,7 +134,7 @@ export type SeasonCityInput = { name: string; country?: string };
 // geocode + fetch + scoring entirely. Mirrors verify.ts's cache, but module-scoped because the
 // data is request-independent (unlike the per-request verify cache).
 // NOTE: a long-running dev server caches each city ONCE per process lifetime, so after changing any
-// signal computed in classify() (daylight, heat, air quality) OR assembled in assessSeason() on the
+// signal computed in classify() (daylight, heat, air quality, uv) OR assembled in assessSeason() on the
 // CitySeasonSummary (elevationM, altitudeAdvisory — the altitude signal) you must RESTART the server to
 // flush cities cached without the new fields — there is deliberately no programmatic invalidation
 // (the cache-read guard below force-refetches a pre-altitude entry as defense in depth, but a changed
@@ -204,8 +205,12 @@ type MonthlyNormals = {
   meanApparentMaxC: number | null;
 }[];
 
-// 12 monthly mean PM2.5 normals (µg/m³) for one city, or null per month when CAMS had no data.
-type AqiMonthlyNormals = Array<{ meanPm25: number | null }>;
+// 12 monthly CAMS normals for one city: the mean PM2.5 (µg/m³) AND the UV index (the typical midday
+// peak — the monthly mean of each day's MAXIMUM hourly UV), each null per month when CAMS had no data.
+// Both signals ride the SAME keyless air-quality fetch, so they're folded and returned together.
+// (Renamed from AqiMonthlyNormals now that it carries a WHO UV field beside the EPA-AQI PM2.5 one — the
+// name reflects the SOURCE, the Copernicus CAMS global model, not one of the two standards it feeds.)
+type CamsMonthlyNormals = Array<{ meanPm25: number | null; uvIndex: number | null }>;
 
 async function fetchNormals(
   lat: number,
@@ -302,21 +307,24 @@ async function fetchNormals(
   return { normals, elevationM };
 }
 
-// One geocoded city's typical monthly PM2.5 (µg/m³) from the CAMS global model via Open-Meteo's
-// keyless air-quality endpoint. SEPARATE from the climate fetch (different host, different history
-// window) and ENTIRELY wrapped so it can only ever return a 12-element array or null — it NEVER
-// throws, so a CAMS outage degrades air quality to "no data" without touching the climate season
-// (assessSeason runs the two fetches with Promise.allSettled). The endpoint serves hourly PM2.5 only
-// (no daily aggregate), so we fold hourly → daily means → monthly means in two passes.
+// One geocoded city's typical monthly PM2.5 (µg/m³) AND UV index from the CAMS global model via
+// Open-Meteo's keyless air-quality endpoint. SEPARATE from the climate fetch (different host, different
+// history window) and ENTIRELY wrapped so it can only ever return a 12-element array or null — it NEVER
+// throws, so a CAMS outage degrades both air quality AND UV to "no data" without touching the climate
+// season (assessSeason runs the two fetches with Promise.allSettled). The endpoint serves both as hourly
+// series in ONE request (adding uv_index to the existing hourly list costs no extra round-trip — measured
+// at ~0.5s, identical to PM2.5 alone, so AQ_TIMEOUT_MS is unchanged), so we fold hourly → per-day
+// aggregate → monthly mean in two passes — with the crucial twist that PM2.5 uses a daily MEAN while UV
+// uses a daily MAX (see Pass 1).
 async function fetchAirQualityNormals(
   lat: number,
   lon: number,
   signal?: AbortSignal,
-): Promise<AqiMonthlyNormals | null> {
+): Promise<CamsMonthlyNormals | null> {
   try {
     const url =
       `${AQ_ENDPOINT}?latitude=${lat}&longitude=${lon}` +
-      `&hourly=pm2_5&start_date=${AQ_START_DATE}&end_date=${AQ_END_DATE}` +
+      `&hourly=pm2_5,uv_index&start_date=${AQ_START_DATE}&end_date=${AQ_END_DATE}` +
       `&domains=cams_global&timezone=UTC`;
     const timeout = AbortSignal.timeout(AQ_TIMEOUT_MS);
     const res = await fetch(url, {
@@ -328,27 +336,43 @@ async function fetchAirQualityNormals(
       return null;
     }
     const data = (await res.json()) as {
-      hourly?: { time?: string[]; pm2_5?: Array<number | null> };
+      hourly?: { time?: string[]; pm2_5?: Array<number | null>; uv_index?: Array<number | null> };
     };
     const h = data?.hourly;
     if (!h?.time || !Array.isArray(h.time)) return null;
     const pm = h.pm2_5 ?? [];
+    const uv = h.uv_index ?? [];
 
-    // Pass 1: hourly → daily means (key on the YYYY-MM-DD prefix). Skip nulls so a gap can't poison
-    // a mean. timezone=UTC means each timestamp belongs cleanly to one calendar day.
+    // Pass 1: hourly → per-day aggregate (key on the YYYY-MM-DD prefix). The two CAMS signals fold
+    // DIFFERENTLY: PM2.5 → a daily MEAN (the 24h average concentration a traveler breathes); UV → a daily
+    // MAX (the midday PEAK). A 24h average of UV is meaningless — the ~16 night hours read UV=0 and would
+    // drag the figure to roughly half the real midday value (Cusco's true year-round-Extreme ~10 would
+    // read as a mild Moderate ~5, silently suppressing every advisory). They're tracked in INDEPENDENT
+    // accumulators in one loop so a null in one signal never drops the other's sample for that hour. Skip
+    // nulls so a gap can't poison either aggregate; timezone=UTC means each timestamp is one calendar day.
     const daily = new Map<string, { sum: number; n: number }>();
+    const dailyUvMax = new Map<string, number>();
     for (let i = 0; i < h.time.length; i++) {
-      const v = pm[i];
-      if (v == null || !Number.isFinite(v)) continue;
       const dayKey = h.time[i].slice(0, 10);
-      const b = daily.get(dayKey) ?? { sum: 0, n: 0 };
-      b.sum += v as number;
-      b.n++;
-      daily.set(dayKey, b);
+      const v = pm[i];
+      if (v != null && Number.isFinite(v)) {
+        const b = daily.get(dayKey) ?? { sum: 0, n: 0 };
+        b.sum += v as number;
+        b.n++;
+        daily.set(dayKey, b);
+      }
+      const uvV = uv[i];
+      if (uvV != null && Number.isFinite(uvV)) {
+        const prev = dailyUvMax.get(dayKey) ?? -Infinity;
+        if ((uvV as number) > prev) dailyUvMax.set(dayKey, uvV as number);
+      }
     }
 
-    // Pass 2: daily means → monthly means (each day weighted equally, so a data-dense day doesn't
-    // dominate). Guard a malformed month index, mirroring fetchNormals.
+    // Pass 2: per-day aggregate → monthly mean (each day weighted equally, so a data-dense day doesn't
+    // dominate). PM2.5 averages the daily means; UV averages the daily maxima. Guard a malformed month
+    // index, mirroring fetchNormals; a month with zero valid days stays null (never 0/0 = NaN). Both stay
+    // RAW here — the single display-rounding (truncTenth for PM2.5, Math.round for UV) happens once in
+    // classify(), so the stored figure and the banded value can't diverge (the raw-vs-rounded discipline).
     const acc = Array.from({ length: 12 }, () => ({ sum: 0, n: 0 }));
     for (const [dayKey, b] of daily) {
       const mo = Number.parseInt(dayKey.slice(5, 7), 10) - 1;
@@ -356,7 +380,17 @@ async function fetchAirQualityNormals(
       acc[mo].sum += b.sum / b.n;
       acc[mo].n++;
     }
-    return acc.map((a) => ({ meanPm25: a.n > 0 ? a.sum / a.n : null }));
+    const uvAcc = Array.from({ length: 12 }, () => ({ sum: 0, n: 0 }));
+    for (const [dayKey, mx] of dailyUvMax) {
+      const mo = Number.parseInt(dayKey.slice(5, 7), 10) - 1;
+      if (!Number.isFinite(mo) || mo < 0 || mo > 11) continue;
+      uvAcc[mo].sum += mx;
+      uvAcc[mo].n++;
+    }
+    return acc.map((a, i) => ({
+      meanPm25: a.n > 0 ? a.sum / a.n : null,
+      uvIndex: uvAcc[i].n > 0 ? uvAcc[i].sum / uvAcc[i].n : null,
+    }));
   } catch {
     // Timeout / abort / network / parse — never evidence of anything, just no air-quality data.
     return null;
@@ -366,13 +400,13 @@ async function fetchAirQualityNormals(
 // Turn 12 monthly normals into 12 scored, labelled MonthSeason records plus the tropical/
 // challenging flags and a best-window string. Takes the city's latitude so it can attach each
 // month's daylight hours + advisory (pure astronomy, no network), and the optional air-quality
-// normals so it can attach the air advisory — both in the SAME place every other MonthSeason field
-// is built, which guarantees daylight, heat AND air-quality ride into the seasonCache with the rest
-// of the summary, never as a later mutation a cache hit would skip. Pure apart from its inputs — so
-// it's easy to test. NOTE altitude is NOT built here: it is a per-CITY (month-invariant) signal, so
-// it's assembled in assessSeason() on the CitySeasonSummary, not in these per-month records (see
-// lib/altitude.ts) — do not move it into classify() to "match the pattern" of daylight/heat/air.
-function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyNormals | null): {
+// normals so it can attach the air-quality AND UV advisories — all in the SAME place every other
+// MonthSeason field is built, which guarantees daylight, heat, air-quality AND UV ride into the
+// seasonCache with the rest of the summary, never as a later mutation a cache hit would skip. Pure
+// apart from its inputs — so it's easy to test. NOTE altitude is NOT built here: it is a per-CITY
+// (month-invariant) signal, so it's assembled in assessSeason() on the CitySeasonSummary, not in these
+// per-month records (see lib/altitude.ts) — do not move it into classify() to "match the pattern".
+function classify(normals: MonthlyNormals, lat: number, camsNormals?: CamsMonthlyNormals | null): {
   months: MonthSeason[];
   tropical: boolean;
   challenging: boolean;
@@ -421,9 +455,14 @@ function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyN
     // Truncate PM2.5 to 0.1 µg/m³ ONCE and use that single value for BOTH the band and the stored
     // display figure, so the tooltip's "~X µg/m³" can never disagree with its band (the heat path's
     // round-once discipline, applied to air). aqiBandFor re-truncates idempotently.
-    const meanPm25Raw = aqiNormals?.[i]?.meanPm25 ?? null;
+    const meanPm25Raw = camsNormals?.[i]?.meanPm25 ?? null;
     const meanPm25 = meanPm25Raw != null ? truncTenth(meanPm25Raw) : null;
     const band = aqiBandFor(meanPm25);
+    // UV rides the SAME CAMS fetch. Round the raw monthly mean-of-daily-max to a whole UV index ONCE,
+    // then band + advise + display from that single integer (WHO UV index is conventionally an integer,
+    // so a fractional 9.2 would never match the "UV ~9" the advisory cites — the raw-vs-rounded lesson).
+    const uvIndexRaw = camsNormals?.[i]?.uvIndex ?? null;
+    const uvIndex = uvIndexRaw != null ? Math.round(uvIndexRaw) : null;
     return {
       month: i + 1,
       label: labelFor(i),
@@ -442,6 +481,9 @@ function classify(normals: MonthlyNormals, lat: number, aqiNormals?: AqiMonthlyN
       meanPm25,
       aqiBand: band,
       aqiAdvisory: aqiAdvisory(band),
+      uvIndex,
+      uvBand: uvBandFor(uvIndex),
+      uvAdvisory: uvAdvisory(uvIndex),
     };
   });
 
@@ -556,10 +598,17 @@ export function buildSeasonNote(cities: CitySeasonSummary[]): string {
   const haveAqi = cities.some(
     (c) => c.source === "open-meteo" && c.months.some((m) => m.meanPm25 != null),
   );
+  const haveUv = cities.some(
+    (c) => c.source === "open-meteo" && c.months.some((m) => m.uvIndex != null),
+  );
   const haveAltitude = cities.some((c) => c.source === "open-meteo" && c.altitudeAdvisory != null);
   return `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
     haveAqi
       ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
+      : ""
+  }${
+    haveUv
+      ? ` UV index is the typical daily midday peak (the monthly mean of each day's maximum UV, averaged across the observed mix of cloudy and clear days in the CAMS reanalysis, ${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a day with below-average cloud can run notably higher, and UV climbs with altitude, so a day trip from the city up to meaningfully higher terrain faces more than the city-base figure shown. It's modeled from reanalysis ozone, aerosols and cloud, not a live reading.`
       : ""
   }${
     haveAltitude
@@ -598,13 +647,20 @@ export async function assessSeason(
     // Serve a cached city ONLY if it (a) was cached by altitude-AWARE code — the `"elevationM" in cached`
     // key-existence check (NOT a value check: a legitimately sea-level/ocean city has elevationM === null
     // but the KEY present) force-refetches an entry cached before the altitude fields existed, so a
-    // long-lived dev server can't serve a stale pre-altitude summary; and (b) actually carries
-    // air-quality data. A city cached after a transient CAMS failure has all-null PM2.5 (the climate
-    // still succeeded, so source is "open-meteo" and it WAS cached) — skipping it here lets the air fetch
-    // retry on a later request instead of suppressing the air advisory for the whole process lifetime
-    // (the same "don't poison a retry" rule the catch below upholds). A genuinely CAMS-uncovered city
-    // re-fetches each time, which is rare and still correct.
-    if (cached && "elevationM" in cached && cached.months.some((m) => m.meanPm25 != null)) {
+    // long-lived dev server can't serve a stale pre-altitude summary; and (b) actually carries BOTH CAMS
+    // signals (PM2.5 AND UV). A city cached after a transient CAMS failure has all-null PM2.5/UV (the
+    // climate still succeeded, so source is "open-meteo" and it WAS cached) — skipping it here lets the
+    // CAMS fetch retry on a later request instead of suppressing the air/UV advisories for the whole
+    // process lifetime (the same "don't poison a retry" rule the catch below upholds). The `&& m.uvIndex
+    // != null` clause does DOUBLE duty: it also force-refetches a city cached before UV existed — such an
+    // entry has m.uvIndex === undefined, and `undefined != null` is false (JS loose equality), so some()
+    // returns false and the city re-fetches; no separate `"uvIndex" in` key-existence check is needed the
+    // way altitude's was. A genuinely CAMS-uncovered city re-fetches each time, which is rare but correct.
+    if (
+      cached &&
+      "elevationM" in cached &&
+      cached.months.some((m) => m.meanPm25 != null && m.uvIndex != null)
+    ) {
       out.push(cached);
       onProgress?.(i + 1, cities.length, name);
       continue;
@@ -619,8 +675,8 @@ export async function assessSeason(
         summary = noData(name, country);
       } else {
         // Run the climate and air-quality fetches in PARALLEL on the geocoded coordinates.
-        // Promise.allSettled keeps them independent: an air-quality failure becomes aqiNormals=null
-        // (no air data) and NEVER rejects the climate season, while a climate failure still degrades
+        // Promise.allSettled keeps them independent: an air-quality failure becomes camsNormals=null
+        // (no air or UV data) and NEVER rejects the climate season, while a climate failure still degrades
         // the city to "no data" exactly as before. fetchAirQualityNormals never throws on its own, but
         // allSettled also stops the climate fetch's deliberate throw-on-error from taking it down.
         const [normalsRes, aqiRes] = await Promise.allSettled([
@@ -628,7 +684,7 @@ export async function assessSeason(
           fetchAirQualityNormals(geo.lat, geo.lon, signal),
         ]);
         const normalsResult = normalsRes.status === "fulfilled" ? normalsRes.value : null;
-        const aqiNormals = aqiRes.status === "fulfilled" ? aqiRes.value : null;
+        const camsNormals = aqiRes.status === "fulfilled" ? aqiRes.value : null;
         // Altitude is assembled HERE, on the CitySeasonSummary, not inside classify() (which stays
         // per-month-only): elevation is month-invariant, so it's a city-level field. The 10m-rounded
         // elevationM fetchNormals returned is BOTH stored and banded by computeAltitudeAdvisory, so the
@@ -640,7 +696,7 @@ export async function assessSeason(
               country,
               geocoded: true,
               source: "open-meteo",
-              ...classify(normalsResult.normals, geo.lat, aqiNormals),
+              ...classify(normalsResult.normals, geo.lat, camsNormals),
               elevationM,
               altitudeAdvisory: computeAltitudeAdvisory(elevationM),
             }
@@ -707,6 +763,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
     const tags: string[] = [];
     if (m.heatAdvisory && m.meanApparentMaxC != null) tags.push(`feels ~${m.meanApparentMaxC}°C`);
     if (m.aqiAdvisory && m.aqiBand) tags.push(`air ${m.aqiBand}`);
+    if (m.uvAdvisory && m.uvIndex != null) tags.push(`UV ${m.uvIndex}`);
     return `${MONTHS_SHORT[m.month - 1]} ${LABEL_WORD[m.label]} (${m.temp}, ${m.meanMaxC}°C, ${m.rain}${
       tags.length ? "; " + tags.join("; ") : ""
     })`;
@@ -715,7 +772,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   // the model adapts the day structure (front-load on short days or in extreme heat, mask/indoors on
   // bad-air days) instead of inferring it from raw numbers.
   const targetBrief = (m: MonthSeason) => {
-    const extras = [m.daylightAdvisory, m.heatAdvisory, m.aqiAdvisory].filter(Boolean);
+    const extras = [m.daylightAdvisory, m.heatAdvisory, m.aqiAdvisory, m.uvAdvisory].filter(Boolean);
     return extras.length ? `${monthBrief(m)}; ${extras.join("; ")}` : monthBrief(m);
   };
   const tm = summary.targetMonth;
@@ -733,6 +790,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   const targetDaylight = targetCue((m) => m?.daylightAdvisory ?? null);
   const targetHeat = targetCue((m) => m?.heatAdvisory ?? null);
   const targetAir = targetCue((m) => m?.aqiAdvisory ?? null);
+  const targetUv = targetCue((m) => m?.uvAdvisory ?? null);
   // Altitude heads-up is trip-level but city-NAMED (a vague "this trip is high" misattributes the day-1
   // advice to the wrong city — the adversarial lens's positional-encoding catch). Built from `grounded`
   // directly, NOT via targetCue, because altitude doesn't depend on a target month.
@@ -767,6 +825,16 @@ export function seasonModelView(summary: SeasonSummary): unknown {
               .filter((m) => m.heatAdvisory)
               .sort((a, b) => (b.meanApparentMaxC ?? 0) - (a.meanApparentMaxC ?? 0))[0]
           : undefined;
+      // UV: surface the single worst UV month for a date-flexible trip (mirrors worstAir/worstHeat) so
+      // the model can steer toward a lower-UV window. But for an equatorial city where EVERY month is at
+      // least Very High (UV >= 8), a "worst month" framing falsely implies the others are gentle — so we
+      // flag yearRoundUvHigh instead (there is no low-UV season to steer to) and omit the worst-month cue.
+      const yearRoundUvHigh =
+        tm == null && c.months.length === 12 && c.months.every((m) => m.uvIndex != null && m.uvIndex >= 8);
+      const worstUv =
+        tm == null && !yearRoundUvHigh
+          ? [...c.months].filter((m) => m.uvAdvisory).sort((a, b) => (b.uvIndex ?? 0) - (a.uvIndex ?? 0))[0]
+          : undefined;
       return {
         name: c.name,
         tropical: c.tropical || undefined,
@@ -784,6 +852,8 @@ export function seasonModelView(summary: SeasonSummary): unknown {
         ...(worstHeat
           ? { worstHeatMonth: `${MONTHS_SHORT[worstHeat.month - 1]} (feels ~${worstHeat.meanApparentMaxC}°C)` }
           : {}),
+        ...(worstUv ? { worstUvMonth: `${MONTHS_SHORT[worstUv.month - 1]} (UV ~${worstUv.uvIndex})` } : {}),
+        ...(yearRoundUvHigh ? { yearRoundUvHigh: true } : {}),
       };
     }),
     targetAssessment: summary.targetAssessment ?? undefined,
@@ -804,6 +874,13 @@ export function seasonModelView(summary: SeasonSummary): unknown {
     ...(targetAir.length > 0
       ? {
           targetAirAdvisory: `${MONTHS[tm! - 1]} air quality — ${targetAir
+            .map((x) => `${x.name}: ${x.v}`)
+            .join(" ")}`,
+        }
+      : {}),
+    ...(targetUv.length > 0
+      ? {
+          targetUvAdvisory: `${MONTHS[tm! - 1]} UV — ${targetUv
             .map((x) => `${x.name}: ${x.v}`)
             .join(" ")}`,
         }
