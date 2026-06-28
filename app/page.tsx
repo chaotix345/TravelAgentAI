@@ -20,6 +20,7 @@ import type {
   RouteLeg,
 } from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
+import { fmtDaylight } from "@/lib/daylight";
 
 const MAX_BRIEF_CHARS = 4000;
 // The route streams progress events as it works. We don't cap total time (a 4-week plan
@@ -1140,7 +1141,7 @@ function CitySeason({
             tabIndex={0}
             title={`${MONTHS_FULL[m.month - 1]}: ${m.temp}, ${m.meanMaxC}°C highs, ${m.rain}${
               m.flags.length ? ` — ${m.flags.join("; ")}` : ""
-            } · ${SEASON_WORD[m.label] ?? m.label}${m.daylightHours != null ? ` · ~${Math.round(m.daylightHours * 2) / 2}h daylight` : ""}`}
+            } · ${SEASON_WORD[m.label] ?? m.label}${m.daylightHours != null ? ` · ${fmtDaylight(m.daylightHours)} daylight` : ""}`}
           >
             {MONTH_INITIALS[m.month - 1]}
           </span>

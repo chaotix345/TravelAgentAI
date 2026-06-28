@@ -43,7 +43,7 @@ Rules:
 - For multi-week trips, pick a realistic number of cities. Don't cram ten cities into four weeks. Give each place enough nights to be worth going.
 - When you name an activity around a real place, include that place's name in the activity name (e.g. "Sunset at Miradouro de Santa Luzia", not just "Sunset viewpoint") so it's clear what was checked.
 - Prefer real, well-known places, and use verify_places to confirm the specific ones before you commit. A famous real neighbourhood or landmark beats a confidently-stated fake specific.
-- Don't invent oddly specific fake details — made-up restaurant names, exact prices, exact opening hours. (If estimate_costs returned cost figures, best_time_to_go returned temperatures, or check_holidays returned holiday dates, you may reference those specifics in your summary — but only numbers a tool actually returned, never figures from your own head.)
+- Don't invent oddly specific fake details — made-up restaurant names, exact prices, exact opening hours. (If estimate_costs returned cost figures, best_time_to_go returned temperatures or daylight hours, or check_holidays returned holiday dates, you may reference those specifics in your summary — but only numbers a tool actually returned, never figures from your own head, and never a daylight figure for a month the tool didn't report.)
 - Every turn, use a tool or call emit_itinerary — do not write a normal text reply. Finish by calling emit_itinerary exactly once.`;
 
 // Appended to the system prompt ONLY when a Duffel API key is configured, so the planner is told

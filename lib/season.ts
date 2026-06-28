@@ -471,7 +471,7 @@ export async function assessSeason(
 
   const haveData = out.some((c) => c.source === "open-meteo");
   const note = haveData
-    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light beyond these figures, and local mountains can trim them.`
+    ? `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.`
     : "Couldn't ground the season for these cities.";
 
   return {
@@ -544,7 +544,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
       ? {
           targetDaylightAdvisory: `${MONTHS[tm! - 1]} daylight — ${targetDaylight
             .map((x) => `${x.name}: ${x.adv}`)
-            .join("; ")}`,
+            .join(" ")}`,
         }
       : {}),
     note: summary.note,
