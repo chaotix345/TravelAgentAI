@@ -10,7 +10,7 @@ ask one or two quick questions first (only when they'd change the plan), then dr
 route and **grounds it in real data with five keyless tools** — it verifies the named places
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
-Wikivoyage), grounds the **timing** in real climate normals (Open-Meteo), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
+Wikivoyage), grounds the **timing** in real climate normals and **daylight hours** (Open-Meteo + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
 one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
@@ -136,8 +136,12 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   genuinely comfortable (Reykjavik). Hemisphere needs no special-casing — labels come from the real
   numbers, so Sydney is correctly warm in January. Keyless and throttled like the geo tools, with a
   process-lifetime cache (normals barely change) and graceful degradation to "no data" on any
-  error. The thresholds are documented, tunable heuristics. It grounds **weather** only — there's
-  no keyless source for tourist crowds — and says so in a caveat.
+  error. The thresholds are documented, tunable heuristics. Alongside the weather it grounds
+  **daylight hours**: day length is a deterministic function of latitude and date, so `lib/daylight.ts`
+  computes it locally (pure astronomy via the NOAA sunrise equation — no network, no failure mode)
+  from the lat the geocode already returned, and attaches a per-city advisory ("~4h of daylight in
+  December — front-load outdoor sightseeing") the model uses to shape each day. It grounds
+  **weather and daylight** only — there's no keyless source for tourist crowds — and says so in a caveat.
 - **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
   The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
   *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)
@@ -434,5 +438,10 @@ small decision, not the planning).
    The lesson it teaches: the first grounding that *isn't* a model tool — an exchange rate is a fact,
    not a decision, so it's a pure server-side transform run after the tool returns, fed back into the
    model's prose so nothing shows `$` next to `£`.
-10. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
+10. ✅ **More grounding since — done.** Further milestones followed the same server-attached pattern:
+    a bounded auto-repair verify round, booking-ready flight detail + smart flight selection, **public
+    holidays** (Nager.Date), real **road travel times** between cities (OSRM), and **daylight hours** —
+    computed from each city's latitude as a deterministic enrichment of `best_time_to_go` (no new tool,
+    no network), so a December plan in Reykjavik front-loads outdoor sightseeing around ~4h of light.
+11. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
     agent.

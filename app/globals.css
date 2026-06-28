@@ -1083,6 +1083,17 @@ button.link:hover {
   color: #3a5f86;
 }
 
+/* The per-city daylight advisory in the CitySeason caption — its own line under the season-tag, so a
+   short-day "front-load outdoor sightseeing" steer reads as decisive guidance, not a stat. Only
+   rendered for a notable target month (the threshold is decided server-side). */
+.daylight-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
 .sources {
   margin-top: 48px;
   padding-top: 18px;

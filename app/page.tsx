@@ -1140,7 +1140,7 @@ function CitySeason({
             tabIndex={0}
             title={`${MONTHS_FULL[m.month - 1]}: ${m.temp}, ${m.meanMaxC}°C highs, ${m.rain}${
               m.flags.length ? ` — ${m.flags.join("; ")}` : ""
-            } · ${SEASON_WORD[m.label] ?? m.label}`}
+            } · ${SEASON_WORD[m.label] ?? m.label}${m.daylightHours != null ? ` · ~${Math.round(m.daylightHours * 2) / 2}h daylight` : ""}`}
           >
             {MONTH_INITIALS[m.month - 1]}
           </span>
@@ -1156,6 +1156,7 @@ function CitySeason({
             </span>
           </>
         )}
+        {tm?.daylightAdvisory && <span className="daylight-note">{tm.daylightAdvisory}</span>}
       </p>
     </div>
   );
