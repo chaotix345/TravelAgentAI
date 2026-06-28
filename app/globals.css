@@ -1114,6 +1114,19 @@ button.link:hover {
   color: #6b3fa0;
 }
 
+/* The per-city ALTITUDE / acclimatization advisory in the CitySeason caption — its own line, same
+   decisive-guidance treatment as the daylight/heat/air notes, with a steel-blue "mountain" hue distinct
+   from the heat orange and air-quality purple. Unlike those three it is NOT gated on a target month
+   (altitude is a fixed property of the city); severity (mild vs serious) is carried by the WORDING, the
+   same way heat-note conveys CAUTION vs DANGER in one style. Server-decided thresholds (lib/altitude.ts). */
+.altitude-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #2f5a6b;
+}
+
 .sources {
   margin-top: 48px;
   padding-top: 18px;

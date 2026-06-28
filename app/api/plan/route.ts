@@ -16,7 +16,7 @@ import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, currencyClause } from "@/
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute, buildRouteSummary, type StoredRouteMatrix } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
-import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth } from "@/lib/season";
+import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth, buildSeasonNote } from "@/lib/season";
 import { assessHolidays, holidayModelView, recomputeHolidays } from "@/lib/holidays";
 import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
 import { homeCurrency, getRate, applyFxToCost, applyFxToFlights, costModelView } from "@/lib/currency";
@@ -188,7 +188,7 @@ const ESTIMATE_COSTS_TOOL: Anthropic.Tool = {
 const BEST_TIME_TOOL: Anthropic.Tool = {
   name: "best_time_to_go",
   description:
-    "Ground the TIMING of your plan in real climate data. Pass your cities (with country), and — if the brief implies WHEN they travel ('in August', 'next spring', specific dates) — the targetMonth (1-12) of the trip. Returns, per city, a 'best months to go' window and a peak/shoulder/off-season weather label for each month, derived from Open-Meteo climate normals (real observed weather, no key); if you gave a targetMonth, it assesses that month at each city. Use it to: time a flexible trip to the best window, WARN the traveler when their chosen month is harsh (peak heat, monsoon, deep winter) and suggest a better one, and tailor day plans to the actual conditions (indoor/early-start in extreme heat, rain backups in a wet month). It ALSO returns three derived signals per month: how much DAYLIGHT each month gives (sunrise-to-sunset hours from each city's latitude) so you can front-load outdoor plans on short days and use long light evenings; a 'feels-like' HEAT advisory when humidity and sun make the midday real-feel taxing (around 37°C feels-like) or dangerous (around 42°C) — so you can front-load mornings or move strenuous plans out of the midday heat; and an AIR-QUALITY advisory when typical PM2.5 pollution is unhealthy that month (so you can build in indoor backups or suggest a cleaner month). It grounds WEATHER comfort, DAYLIGHT, HEAT and AIR QUALITY only — not tourist crowds or prices, which depend on holidays and festivals — so never claim crowd levels from it. Call this when timing matters: the brief gives or leaves open the dates, the destination has a strong season (Mediterranean summer, tropical monsoon, far-north winter, dangerous summer heat, a pollution season), or shifting the month would clearly help.",
+    "Ground the TIMING of your plan in real climate data. Pass your cities (with country), and — if the brief implies WHEN they travel ('in August', 'next spring', specific dates) — the targetMonth (1-12) of the trip. Returns, per city, a 'best months to go' window and a peak/shoulder/off-season weather label for each month, derived from Open-Meteo climate normals (real observed weather, no key); if you gave a targetMonth, it assesses that month at each city. Use it to: time a flexible trip to the best window, WARN the traveler when their chosen month is harsh (peak heat, monsoon, deep winter) and suggest a better one, and tailor day plans to the actual conditions (indoor/early-start in extreme heat, rain backups in a wet month). It ALSO returns three derived signals per month: how much DAYLIGHT each month gives (sunrise-to-sunset hours from each city's latitude) so you can front-load outdoor plans on short days and use long light evenings; a 'feels-like' HEAT advisory when humidity and sun make the midday real-feel taxing (around 37°C feels-like) or dangerous (around 42°C) — so you can front-load mornings or move strenuous plans out of the midday heat; and an AIR-QUALITY advisory when typical PM2.5 pollution is unhealthy that month (so you can build in indoor backups or suggest a cleaner month). For any city that sits at high elevation it ALSO returns a per-city ALTITUDE / acclimatization advisory (a fixed property of the city, independent of the month) so you can pace a gentle arrival day and warn about altitude sickness. It grounds WEATHER comfort, DAYLIGHT, HEAT, AIR QUALITY and ALTITUDE only — not tourist crowds or prices, which depend on holidays and festivals — so never claim crowd levels from it. Call this when timing matters: the brief gives or leaves open the dates, the destination has a strong season (Mediterranean summer, tropical monsoon, far-north winter, dangerous summer heat, a pollution season), or shifting the month would clearly help — and ALSO whenever a city may sit at high elevation (the Andes, Himalaya/Tibet, Ethiopian highlands, Mexican plateau, a high Rocky Mountain town), even with no dates, to ground its altitude.",
   input_schema: {
     type: "object",
     properties: {
@@ -501,7 +501,11 @@ function annotateItinerary(
       targetAssessment: season.targetMonth
         ? seasonTargetLine(matchedSeason, season.targetMonth)
         : null,
-      note: season.note,
+      // Recompute the note against the FINAL emitted cities (not the full assessed set), so a source
+      // disclosure — elevation, feels-like heat, CAMS air quality — is credited only when that signal
+      // actually survives to the plan, the same recompute-against-the-plan discipline targetAssessment
+      // follows just above. (Fixes a stale disclosure when the model drops the only high/hot/polluted city.)
+      note: buildSeasonNote(matchedSeason),
       caveat: season.caveat,
     };
   }
