@@ -1085,8 +1085,8 @@ function SeasonBlock({ season }: { season: SeasonSummary }) {
         <span
           className="badge ok"
           tabIndex={0}
-          title={`Grounded in real climate, daylight, feels-like heat, air-quality${
-            season.cities.some((c) => c.altitudeAdvisory != null) ? " and elevation data" : ""
+          title={`Grounded in real climate, daylight, feels-like heat, air-quality and UV${
+            season.cities.some((c) => c.altitudeAdvisory != null) ? ", plus elevation data" : ""
           } — not crowds`}
         >
           grounded
@@ -1149,6 +1149,10 @@ function CitySeason({
               m.heatAdvisory && m.meanApparentMaxC != null ? ` · feels like ~${m.meanApparentMaxC}°C` : ""
             }${
               m.aqiAdvisory ? ` · air: ${m.aqiBand} (~${m.meanPm25} µg/m³ PM2.5)` : ""
+            }${
+              m.uvIndex != null
+                ? ` · UV ${m.uvIndex}${m.uvAdvisory && m.uvBand ? ` (${m.uvBand})` : ""}`
+                : ""
             }`}
           >
             {MONTH_INITIALS[m.month - 1]}
@@ -1168,6 +1172,7 @@ function CitySeason({
         {tm?.daylightAdvisory && <span className="daylight-note">{tm.daylightAdvisory}</span>}
         {tm?.heatAdvisory && <span className="heat-note">{tm.heatAdvisory}</span>}
         {tm?.aqiAdvisory && <span className="aqi-note">{tm.aqiAdvisory}</span>}
+        {tm?.uvAdvisory && <span className="uv-note">{tm.uvAdvisory}</span>}
         {/* Altitude renders UNCONDITIONALLY (NOT gated on tm) — it's month-invariant, so a dateless
             high-city trip must still show it; gating it on a target month is the exact silent-drop bug
             the daylight panel caught. It lives on the CitySeasonSummary (season), not a MonthSeason. */}

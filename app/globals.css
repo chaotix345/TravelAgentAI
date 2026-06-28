@@ -1127,6 +1127,18 @@ button.link:hover {
   color: #2f5a6b;
 }
 
+/* The per-city UV / sun-safety advisory in the CitySeason caption — its own line under the heat/air
+   notes, same decisive-guidance treatment, with a sun-amber hue distinct from the heat orange, air
+   purple and altitude steel-blue. Gated on a notable target month like heat/air; severity (very high
+   vs extreme) is carried by the WORDING in one style. Server-decided thresholds (lib/uv.ts). */
+.uv-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #8a6500;
+}
+
 .sources {
   margin-top: 48px;
   padding-top: 18px;
