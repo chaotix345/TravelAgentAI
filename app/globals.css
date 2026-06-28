@@ -1094,6 +1094,26 @@ button.link:hover {
   color: var(--ink);
 }
 
+/* The per-city HEAT and AIR-QUALITY advisories in the CitySeason caption — each its own line under
+   the daylight note, same decisive-guidance treatment, distinct hues so a "midday is dangerous" heat
+   steer reads apart from a "build in indoor backups" air-quality steer. Both render only for a
+   notable target month (the thresholds are decided server-side in lib/airheat.ts). */
+.heat-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #b4530f;
+}
+
+.aqi-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #6b3fa0;
+}
+
 .sources {
   margin-top: 48px;
   padding-top: 18px;

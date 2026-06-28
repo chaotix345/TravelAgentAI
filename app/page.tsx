@@ -1085,7 +1085,7 @@ function SeasonBlock({ season }: { season: SeasonSummary }) {
         <span
           className="badge ok"
           tabIndex={0}
-          title="Grounded in Open-Meteo climate normals (ERA5) — real observed weather, not crowds"
+          title="Grounded in real climate, daylight, feels-like heat and air-quality data — not crowds"
         >
           grounded
         </span>
@@ -1141,7 +1141,13 @@ function CitySeason({
             tabIndex={0}
             title={`${MONTHS_FULL[m.month - 1]}: ${m.temp}, ${m.meanMaxC}°C highs, ${m.rain}${
               m.flags.length ? ` — ${m.flags.join("; ")}` : ""
-            } · ${SEASON_WORD[m.label] ?? m.label}${m.daylightHours != null ? ` · ${fmtDaylight(m.daylightHours)} daylight` : ""}`}
+            } · ${SEASON_WORD[m.label] ?? m.label}${
+              m.daylightHours != null ? ` · ${fmtDaylight(m.daylightHours)} daylight` : ""
+            }${
+              m.heatAdvisory && m.meanApparentMaxC != null ? ` · feels like ~${m.meanApparentMaxC}°C` : ""
+            }${
+              m.aqiAdvisory ? ` · air: ${m.aqiBand} (~${m.meanPm25} µg/m³ PM2.5)` : ""
+            }`}
           >
             {MONTH_INITIALS[m.month - 1]}
           </span>
@@ -1158,6 +1164,8 @@ function CitySeason({
           </>
         )}
         {tm?.daylightAdvisory && <span className="daylight-note">{tm.daylightAdvisory}</span>}
+        {tm?.heatAdvisory && <span className="heat-note">{tm.heatAdvisory}</span>}
+        {tm?.aqiAdvisory && <span className="aqi-note">{tm.aqiAdvisory}</span>}
       </p>
     </div>
   );
