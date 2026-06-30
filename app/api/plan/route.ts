@@ -8,11 +8,12 @@ import {
   type FlightSummary,
   type HolidaySummary,
   type Itinerary,
+  type JetlagSummary,
   type SeasonSummary,
   type VerifiedItinerary,
   type VerifyStatus,
 } from "@/lib/schema";
-import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, currencyClause } from "@/lib/prompt";
+import { SYSTEM_PROMPT, FLIGHTS_CLAUSE, ORIGIN_CLAUSE, JETLAG_CLAUSE, currencyClause } from "@/lib/prompt";
 import { verifyPlaces, type VerifyResult } from "@/lib/verify";
 import { checkRoute, buildRouteSummary, type StoredRouteMatrix } from "@/lib/route";
 import { estimateCosts, parseStyle, type CostEstimate, type CityCost } from "@/lib/cost";
@@ -20,6 +21,7 @@ import { assessSeason, seasonModelView, seasonTargetLine, parseTargetMonth, buil
 import { assessHolidays, holidayModelView, recomputeHolidays } from "@/lib/holidays";
 import { findFlights, flightModelView, type FlightResult } from "@/lib/flights";
 import { homeCurrency, getRate, applyFxToCost, applyFxToFlights, costModelView } from "@/lib/currency";
+import { computeJetlag } from "@/lib/jetlag";
 
 // The Anthropic SDK needs the Node runtime (not edge).
 export const runtime = "nodejs";
@@ -351,8 +353,9 @@ function coerceArray(value: unknown): unknown[] {
 }
 
 // The traveler's explicit departure city from the "Flying from?" field. It's the only user input
-// that flows toward both the model's context AND an outbound API (Duffel), so we sanitize it
-// server-side (the client maxLength is UX only): strip control characters — the prompt-injection
+// that flows toward both the model's context AND outbound APIs (Duffel for flight pricing, Open-Meteo
+// for the keyless jet-lag timezone lookup), so we sanitize it server-side (the client maxLength is UX
+// only): strip control characters — the prompt-injection
 // vector, e.g. a stray newline that fakes a fresh instruction block — collapse whitespace, and
 // hard-cap the length (a city/airport name never needs 120 chars). The cleaned value rides in the
 // USER turn, never the system prompt, so this is defense-in-depth, not the sole boundary.
@@ -401,6 +404,11 @@ function annotateItinerary(
   // if the model reordered after the route check) and returns null when there's nothing worth showing
   // — the same recompute-against-the-final-plan discipline the budget and season verdict follow.
   routeEstimate: StoredRouteMatrix | null,
+  // The jet-lag crossing, computed by the emit handler's async pre-pass (geocode origin + first city
+  // to IANA timezones, derive the DST-correct delta) and already resolved to a JetlagSummary or null
+  // before this runs. annotateItinerary is — and MUST remain — SYNCHRONOUS, so every async pre-pass
+  // (the FX fetches, this jet-lag geocode) completes BEFORE it's called. null → no jet-lag block.
+  jetlag: JetlagSummary | null,
 ): VerifiedItinerary {
   const checked = [...cache.values()];
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -531,6 +539,11 @@ function annotateItinerary(
     ...(flightsOut ? { flights: flightsOut } : {}),
     ...(holidaysOut ? { holidays: holidaysOut } : {}),
     ...(routeOut ? { route: routeOut } : {}),
+    // jetlag is already gated to source:"computed" above the 3-hour floor (computeJetlag returns null
+    // otherwise), so a present value always means a crossing worth showing — same omit-on-nothing
+    // discipline as flights/route. Recompute-against-the-final-plan is automatic: the pre-pass used
+    // itinerary.cities[0], the FIRST city of THIS emitted plan, so it can't name a dropped city.
+    ...(jetlag ? { jetlag } : {}),
     cities,
   };
 }
@@ -562,7 +575,9 @@ export async function POST(req: Request) {
     const body = JSON.parse(raw);
     brief = typeof body?.brief === "string" ? body.brief.trim() : "";
     // The explicit departure city (from the "Flying from?" field). Sanitized now so it's clean
-    // wherever it's used; only acted on when flights are enabled (the keyed-tool gate, below).
+    // wherever it's used. When flights are enabled AND it's non-empty it also makes find_flights a
+    // required step (see hasFlightOrigin). When it's non-empty REGARDLESS of flights it enables the
+    // keyless jet-lag grounding (see hasOrigin) — so origin is acted on even with no Duffel key.
     origin = sanitizeOrigin(body?.origin);
     if (Array.isArray(body?.clarifications)) {
       clarifications = (body.clarifications as unknown[])
@@ -630,17 +645,22 @@ export async function POST(req: Request) {
   // rate — no extra model turn, since an exchange rate is a fact, not a decision. The clause is only
   // added when home isn't USD; when it is, there's nothing to convert and the prompt is unchanged.
   const HOME = homeCurrency();
-  // The traveler's explicit departure city, acted on only when flights are actually enabled. The
-  // clause added here is generic, server-controlled text (see ORIGIN_CLAUSE); the value itself rides
-  // in the user turn (appended to the brief below), keeping raw user input out of the high-trust
-  // system prompt. hasOrigin also makes flights a REQUIRED step in the loop: emit is withheld until
-  // find_flights has run, so an explicit origin reliably lights up the fare instead of depending on
-  // the model choosing to price it.
-  const hasOrigin = flightsEnabled && origin.length > 0;
+  // The traveler's explicit departure city drives TWO separate things, deliberately split so jet-lag
+  // stays keyless:
+  //   • hasOrigin (origin given, ANY deployment) — adds JETLAG_CLAUSE and triggers the keyless jet-lag
+  //     grounding pass at emit. The value rides in the user turn (appended to the brief below), keeping
+  //     raw user input out of the high-trust system prompt; the clause is generic server-controlled text.
+  //   • hasFlightOrigin (origin given AND a Duffel key) — adds the find_flights-specific ORIGIN_CLAUSE
+  //     and makes flights a REQUIRED step (emit is withheld until find_flights runs; see owesFlights), so
+  //     an explicit origin reliably lights up the fare. This MUST stay gated on flightsEnabled — withholding
+  //     emit for a find_flights tool that isn't even offered (keyless) would deadlock the loop.
+  const hasOrigin = origin.length > 0;
+  const hasFlightOrigin = flightsEnabled && hasOrigin;
   const systemPrompt =
     SYSTEM_PROMPT +
     (flightsEnabled ? FLIGHTS_CLAUSE : "") +
-    (hasOrigin ? ORIGIN_CLAUSE : "") +
+    (hasFlightOrigin ? ORIGIN_CLAUSE : "") +
+    (hasOrigin ? JETLAG_CLAUSE : "") +
     (HOME !== "USD" ? currencyClause(HOME) : "");
 
   const client = new Anthropic();
@@ -673,9 +693,9 @@ export async function POST(req: Request) {
       // a multi-city trip then gets a turn to check the route; the last turn we force it
       // to emit the final itinerary.
       // Append the explicit origin to the brief as a labeled line in the USER turn (not the system
-      // prompt). The model reads it for prose and to pick its first/last cities; the find_flights
-      // handler overrides the tool's origin arg with this same server-held value, so the actual
-      // search is grounded in it regardless of what the model echoes.
+      // prompt). The model reads it for prose and to pick its first/last cities. When flights are
+      // enabled the find_flights handler overrides the tool's origin arg with this same server-held
+      // value; and regardless of a Duffel key, the same origin drives the keyless jet-lag pass at emit.
       const briefForModel = hasOrigin ? `${brief}\n\nFlying from: ${origin}` : brief;
       const messages: Anthropic.MessageParam[] = [{ role: "user", content: briefForModel }];
       if (clarifications.length > 0) {
@@ -848,7 +868,7 @@ export async function POST(req: Request) {
               // timing -> holidays -> flights), so this only removes the early exit: a grounding tool is always
               // offered until flightedOnce, and find_flights' handler always sets flightedOnce (even
               // on an "unavailable" result), after which emit returns. No reorder, no deadlock.
-              const owesFlights = flightsEnabled && hasOrigin && !flightedOnce;
+              const owesFlights = hasFlightOrigin && !flightedOnce;
               toolsForTurn = owesFlights ? [...optional] : [...optional, EMIT_ITINERARY_TOOL];
               toolChoice = { type: "any", disable_parallel_tool_use: true };
             } else {
@@ -932,6 +952,22 @@ export async function POST(req: Request) {
             // If the model emitted straight off an optional turn (pricing/routing/timing was the
             // last label), transition cleanly to finalizing before the plan paints.
             send({ type: "status", phase: "finalizing" });
+            // Jet-lag pre-pass — the origin-relative grounding. When the traveler gave a departure
+            // city, geocode it + the FIRST emitted city to IANA timezones (keyless Open-Meteo) and
+            // compute the DST-correct crossing for the travel month. Keyless, so gated on hasOrigin
+            // (origin given) — NOT on a Duffel key. Two fast parallel geocodes run under the
+            // finalizing status; any miss/below-the-3h-floor → null → no block. This async work MUST
+            // finish before the synchronous annotateItinerary (the FX-pass discipline). Uses
+            // itinerary.cities[0], so it's grounded against the FINAL emitted plan.
+            const jetlag = hasOrigin
+              ? await computeJetlag(
+                  origin,
+                  itinerary.cities[0]?.name,
+                  itinerary.cities[0]?.country,
+                  seasonEstimate?.targetMonth ?? null,
+                  req.signal,
+                )
+              : null;
             send({
               type: "itinerary",
               itinerary: annotateItinerary(
@@ -942,6 +978,7 @@ export async function POST(req: Request) {
                 flightEstimate,
                 holidayEstimate,
                 routeEstimate,
+                jetlag,
               ),
             });
             return;
@@ -1336,13 +1373,13 @@ export async function POST(req: Request) {
             // sanitized value wins over whatever the model echoed in the tool call (never trust the
             // model to faithfully reproduce user input). Falls back to the model's origin otherwise.
             const modelOrigin = str(input.origin);
-            if (hasOrigin && modelOrigin && modelOrigin.toLowerCase() !== origin.toLowerCase()) {
+            if (hasFlightOrigin && modelOrigin && modelOrigin.toLowerCase() !== origin.toLowerCase()) {
               console.warn(
                 `find_flights origin override: model sent "${modelOrigin}", using "${origin}".`,
               );
             }
             const flightInput = {
-              origin: (hasOrigin ? origin : modelOrigin) ?? "",
+              origin: (hasFlightOrigin ? origin : modelOrigin) ?? "",
               arriveCity: str(input.arriveCity) ?? "",
               arriveCountry: str(input.arriveCountry),
               departCity: str(input.departCity),

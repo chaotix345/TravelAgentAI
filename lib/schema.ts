@@ -404,6 +404,36 @@ export type RouteSummary = {
   note: string; // data-source + mode-honesty disclosure
 };
 
+// Same Approach-B idea applied to JET-LAG — the FIRST origin-relative grounded signal. Every other
+// signal is a fact about the destination; jet-lag is a fact about the RELATIONSHIP between the
+// traveler's departure timezone and the first destination's: the UTC-offset delta, the direction of
+// travel (east = phase advance = harder; west = phase delay = easier), an evidence-based adjustment
+// estimate, and a light-exposure cue. It's computed SERVER-SIDE (lib/jetlag.ts) after the plan emits
+// — geocode each city to an IANA timezone via keyless Open-Meteo Geocoding, then derive a DST-correct
+// offset via Intl on a travel-month date — so, like daylight/FX, it needs no model turn, and the
+// displayed strings are OURS, never the model's claim. It is KEYLESS (no Duffel key needed): the
+// "Flying from?" origin alone drives it. GENERAL travel guidance, NOT medical advice; NO drug names /
+// no melatonin / no dosing (the pollen + altitude discipline); the adjustment estimate is a range, not
+// a false-precision point. Attached ONLY when computable AND the crossing clears the 3-hour floor —
+// absent otherwise (absence means "unremarkable crossing", never a rendered "no jet lag"). All advisory
+// strings are server-computed; the UI prints them verbatim. Self-contained (no server-only import).
+export type JetlagSummary = {
+  source: "computed";
+  origin: string; // the departure city as the traveler phrased it (parsed of any ", Country" tail)
+  originTz: string; // resolved IANA timezone, e.g. "Australia/Sydney"
+  destinationCity: string; // the first city of the trip (the one flown into)
+  destinationTz: string; // resolved IANA timezone, e.g. "Asia/Tokyo"
+  deltaMinutes: number; // CANONICAL shorter-arc delta in [-720, 720]; sign: + = adapt east, - = adapt west (for a cross-dateline trip this can flip sign vs the raw clock offset stated in the headline)
+  direction: "east" | "west"; // "same"/below-floor crossings aren't attached at all
+  adjustmentDays: number; // central estimate (the UI shows a ±1-day range string, not this raw int)
+  headline: string; // plain-language offset statement
+  adjustment: string; // the "allow roughly N–M days" line, with the east/west rule of thumb
+  light: string; // light-exposure direction cue (+ antidromic caveat appended for a >8h eastward shift)
+  dayOne: string; // gentle-first-day pacing tip
+  returnNote: string | null; // one-line note on the return-leg direction, or null
+  disclosure: string; // not-medical-advice + DST-month + Open-Meteo CC-BY attribution
+};
+
 export type VerifiedCity = Omit<City, "days"> & {
   days: VerifiedDay[];
   cost?: CityCostSummary;
@@ -416,4 +446,5 @@ export type VerifiedItinerary = Omit<Itinerary, "cities"> & {
   flights?: FlightSummary;
   holidays?: HolidaySummary;
   route?: RouteSummary;
+  jetlag?: JetlagSummary;
 };
