@@ -10,7 +10,7 @@ ask one or two quick questions first (only when they'd change the plan), then dr
 route and **grounds it in real data with five keyless tools** — it verifies the named places
 against a free geo database (OpenStreetMap + Wikipedia), for a multi-city trip checks the real
 distances along the route, grounds the **budget** in real cost data (World Bank price levels +
-Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read, **air quality**, **UV / sun-safety** and **altitude / acclimatization** (Open-Meteo ERA5 + Copernicus CAMS + terrain elevation + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
+Wikivoyage), grounds the **timing** in real climate normals, **daylight hours**, a **"feels-like" heat** read, **air quality**, **UV / sun-safety**, **altitude / acclimatization** and (for European cities) **pollen / allergy season** (Open-Meteo ERA5 + Copernicus CAMS global & European + terrain elevation + latitude-based astronomy), and flags the **public holidays** that close attractions or spike domestic travel in your dates (Nager.Date) — all in a single
 agent loop, streaming live progress and marking each activity confirmed-real in the UI. With an
 optional **Duffel** API key it also prices the **flights** — the first tool that needs a key, and
 one that degrades gracefully to nothing when no key is set. Every money figure — the budget and the
@@ -152,11 +152,15 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   month-independent signal, so it attaches to the city, not each month); and a **UV / sun-safety
   advisory** — the SAME Copernicus CAMS fetch that returns PM2.5 also returns the hourly UV index, folded
   to each month's typical midday peak, so a high-altitude tropical base like Cusco (UV ~11 year-round)
-  warns "SPF50+, a hat, and stay out of the midday sun" while an ordinary temperate summer stays silent.
-  All five fold into the season
+  warns "SPF50+, a hat, and stay out of the midday sun" while an ordinary temperate summer stays silent;
+  and a **pollen / allergy advisory** (European cities) — a third keyless fetch pulls ~2 years of Copernicus
+  CAMS *European*-model pollen on the same coordinates (the global model the PM2.5/UV fetch uses returns the
+  pollen columns all-null), so Berlin in April warns "birch pollen runs high — if you're prone to hay fever,
+  bring what you normally take", degrading to no signal outside Europe.
+  All six fold into the season
   pass with no new model turn (a fact a tool already has the
   data for doesn't earn its own turn) and each degrades independently to nothing. It grounds
-  **weather, daylight, heat, air quality, UV and altitude** only — there's no keyless source for tourist crowds —
+  **weather, daylight, heat, air quality, UV, altitude and (European) pollen** only — there's no keyless source for tourist crowds —
   and says so in a caveat.
 - **`lib/airheat.ts`** — the pure (zero-import, network-free) functions behind two of those signals:
   the "feels-like" **heat advisory** (CAUTION ≥ 37°C / DANGER ≥ 42°C on the ERA5 apparent-temperature
@@ -180,6 +184,14 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   request), folded hourly → daily **max** (the midday peak, never a night-dragged 24h mean) → monthly mean.
   General sun-safety travel info with no skin-type-specific burn-time claims; the threshold lives
   server-side like the rest.
+- **`lib/pollen.ts`** — the pure (zero-import, network-free) functions behind the **pollen / allergy advisory**:
+  per-species fire thresholds (grains/m³, monthly mean of daily means) calibrated from cited European aerobiology
+  scales (SILAM/FMI, EAACI, OPDEC), firing only when a species runs high enough to matter to a hay-fever sufferer
+  (a notch into "Moderate", the "only warn when it changes the day" calibration). It names the firing species and
+  embeds the figure, with behavioral, drug-name-free, opt-in wording ("if you're prone to hay fever, bring what you
+  normally take"). Unlike UV, pollen needs its OWN keyless fetch (Copernicus CAMS *European* model,
+  `domains=cams_europe`) and is **European cities only** — the network fetch (with a discriminated ok / outside-
+  coverage / transient-error result, so a timeout never caches a city as non-European) stays in `lib/season.ts`.
 - **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
   The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
   *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)
@@ -336,9 +348,9 @@ heat, 37 °C") so the agent can warn the traveler and suggest a better window, o
 (early starts, shaded afternoons, rain backups). Like the budget, the **displayed seasonality is
 server-attached** (`annotateItinerary`, with the target-month verdict recomputed from the final
 cities), never the model's claim. It now also grounds **daylight hours, a "feels-like" heat read,
-air quality and UV / sun-safety** per month (computed from the same geocode/fetch, server-side, with no extra model
+air quality, UV / sun-safety and (for European cities) pollen / allergy season** per month (computed from the same geocode/fetch, server-side, with no extra model
 turn) — but still no tourist crowds (no keyless source), so a caveat says a weather-mild month can
-still be the busiest, and the air-quality and UV figures are flagged as monthly normals, not live readings.
+still be the busiest, and the air-quality, UV and pollen figures are flagged as monthly normals, not live readings.
 
 ## Grounding the flights (the first keyed tool)
 
@@ -481,10 +493,11 @@ small decision, not the planning).
 10. ✅ **More grounding since — done.** Further milestones followed the same server-attached pattern:
     a bounded auto-repair verify round, booking-ready flight detail + smart flight selection, **public
     holidays** (Nager.Date), real **road travel times** between cities (OSRM), **daylight hours**, a
-    **"feels-like" heat + air-quality** pass, **altitude / acclimatization**, and a **UV / sun-safety**
-    read — all folded into `best_time_to_go` as deterministic
+    **"feels-like" heat + air-quality** pass, **altitude / acclimatization**, a **UV / sun-safety**
+    read, and (for European cities) a **pollen / allergy-season** flag — all folded into `best_time_to_go` as deterministic
     enrichments (no new tool, no extra model turn), so a December plan in Reykjavik front-loads outdoor
     sightseeing around ~4h of light, Dubai in August warns of ~45°C feels-like heat, Delhi in
-    November flags typically unhealthy air with an N95 nudge, and Cusco warns of year-round extreme UV.
+    November flags typically unhealthy air with an N95 nudge, Cusco warns of year-round extreme UV, and
+    Berlin in April flags high birch pollen for hay-fever sufferers.
 11. Then the rest of the vision: deeper deals and eventually booking — each a new tool on the same
     agent.

@@ -1139,6 +1139,17 @@ button.link:hover {
   color: #8a6500;
 }
 
+/* The per-city POLLEN / allergy advisory in the CitySeason caption — its own line under heat/air/UV, gated on
+   the target month firing a pollen advisory (European cities only). Muted forest green, distinct from heat
+   #b4530f, aqi #6b3fa0, altitude #2f5a6b and uv #8a6500. Server-decided thresholds (lib/pollen.ts). */
+.pollen-note {
+  display: block;
+  margin-top: 5px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #4a7c59;
+}
+
 .sources {
   margin-top: 48px;
   padding-top: 18px;

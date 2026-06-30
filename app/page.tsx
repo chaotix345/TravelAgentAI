@@ -1087,6 +1087,8 @@ function SeasonBlock({ season }: { season: SeasonSummary }) {
           tabIndex={0}
           title={`Grounded in real climate, daylight, feels-like heat, air-quality and UV${
             season.cities.some((c) => c.altitudeAdvisory != null) ? ", plus elevation data" : ""
+          }${
+            season.cities.some((c) => c.pollenFetched === true) ? ", plus pollen (European cities)" : ""
           } — not crowds`}
         >
           grounded
@@ -1153,7 +1155,7 @@ function CitySeason({
               m.uvIndex != null
                 ? ` · UV ${m.uvIndex}${m.uvAdvisory && m.uvBand ? ` (${m.uvBand})` : ""}`
                 : ""
-            }`}
+            }${m.pollenTag ? ` · pollen: ${m.pollenTag}` : ""}`}
           >
             {MONTH_INITIALS[m.month - 1]}
           </span>
@@ -1173,6 +1175,10 @@ function CitySeason({
         {tm?.heatAdvisory && <span className="heat-note">{tm.heatAdvisory}</span>}
         {tm?.aqiAdvisory && <span className="aqi-note">{tm.aqiAdvisory}</span>}
         {tm?.uvAdvisory && <span className="uv-note">{tm.uvAdvisory}</span>}
+        {/* Pollen is per-month + advisory-gated like heat/air/UV, and EUROPEAN cities only — a non-European
+            city simply has no pollenAdvisory, so this stays absent with no "no data" noise. The Europe-only
+            limitation, when it bites (a mixed EU/non-EU trip), is disclosed contextually in the season note. */}
+        {tm?.pollenAdvisory && <span className="pollen-note">{tm.pollenAdvisory}</span>}
         {/* Altitude renders UNCONDITIONALLY (NOT gated on tm) — it's month-invariant, so a dateless
             high-city trip must still show it; gating it on a target month is the exact silent-drop bug
             the daylight panel caught. It lives on the CitySeasonSummary (season), not a MonthSeason. */}

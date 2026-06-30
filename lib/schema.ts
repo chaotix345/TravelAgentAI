@@ -177,6 +177,16 @@ export type MonthSeason = {
   // null below the floor. Advisory-only: it NEVER touches the comfort score or label (a cool place can have
   // brutal UV — high-altitude tropics, spring snow-glare). The threshold + wording live in lib/uv.ts.
   uvAdvisory: string | null;
+  // Pollen / allergy-season (EUROPEAN cities only — the Copernicus CAMS European model has no global pollen).
+  // pollenTag is a compact tooltip label naming the species that run high this month with their (rounded) typical
+  // monthly-mean grains/m³ ("birch 86" / "grass 22, ragweed 14"); pollenAdvisory is the full allergy line. Both
+  // are null when no species clears its advisory floor that month — AND both are null for every month of a
+  // non-European city (no coverage; distinguish that case via the city-level pollenFetched flag). Computed
+  // server-side from the same rounded per-species values, so the tag and the advisory always agree (the
+  // raw-vs-rounded round-once lesson). Advisory-only: pollen NEVER touches the comfort score or season label.
+  // The thresholds + wording live in lib/pollen.ts. See pollenFetched on CitySeasonSummary for coverage state.
+  pollenTag: string | null;
+  pollenAdvisory: string | null;
 };
 export type CitySeasonSummary = {
   name: string;
@@ -202,6 +212,16 @@ export type CitySeasonSummary = {
   // server-side (lib/altitude.ts) like daylight/heat/air; the UI prints this verbatim. Surfaces
   // REGARDLESS of a target month (altitude doesn't depend on when you go).
   altitudeAdvisory: string | null;
+  // Pollen-coverage state for the city, a deliberate TRI-STATE encoded as an OPTIONAL boolean (the only signal
+  // that needs three states): true = a European city whose CAMS pollen fetch succeeded (the per-month pollenTag/
+  // pollenAdvisory carry the data); false = a city the pollen endpoint DEFINITIVELY reported outside coverage (a
+  // non-European "no data" 400) — so the UI/model know to say nothing about pollen for it rather than imply it's
+  // pollen-free; ABSENT (key not present) = a transient pollen-fetch error OR an entry cached before pollen
+  // existed, which must NOT be read as "non-European" and must trigger a re-fetch. The seasonCache read-guard
+  // keys off `"pollenFetched" in cached` (key-existence, like elevationM's), so an absent key force-refetches a
+  // pre-pollen or transiently-failed city while a present `false` legitimately serves a cached non-European city.
+  // noData() leaves it absent (a city we never grounded has no coverage verdict). See lib/pollen.ts / lib/season.ts.
+  pollenFetched?: boolean;
 };
 export type SeasonSummary = {
   cities: CitySeasonSummary[];
