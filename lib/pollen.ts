@@ -103,16 +103,18 @@ export function pollenAdvisory(readings: PollenReadings | null): string | null {
     "if you're prone to hay fever, bring whatever you normally take for it and check a local daily pollen forecast on arrival.";
   if (firing.length === 1) {
     const f = firing[0];
-    return `${SPECIES_LABEL[f.species]} pollen runs high this month (averaging around ${f.value} grains/m³) — ${tail}`;
+    return `${SPECIES_LABEL[f.species]} pollen runs high this month (around ${f.value} grains/m³ on average) — ${tail}`;
   }
-  // Two or more: "Grass and ragweed" / "Birch, grass and ragweed", with the per-species figures after.
+  // Two or more: "Grass and ragweed" / "Birch, grass and ragweed", with the per-species figures after. "both" for
+  // a pair, "all" for three or more; figures use the same "around N grains/m³ on average" phrasing as the single case.
   const names = firing.map((f) => SPECIES_LABEL[f.species]);
   const joined =
     names.length === 2
       ? `${names[0]} and ${names[1]}`
       : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-  const figures = firing.map((f) => `${SPECIES_LABEL[f.species].toLowerCase()} ~${f.value}`).join(", ");
-  return `${joined} pollen all run high this month (${figures} grains/m³) — ${tail}`;
+  const quantifier = firing.length === 2 ? "both" : "all";
+  const figures = firing.map((f) => `${SPECIES_LABEL[f.species].toLowerCase()} around ${f.value}`).join(", ");
+  return `${joined} pollen ${quantifier} run high this month (${figures} grains/m³ on average) — ${tail}`;
 }
 
 // A compact label for the month-strip tooltip, e.g. "birch 86" or "grass 22, ragweed 14", or null when nothing

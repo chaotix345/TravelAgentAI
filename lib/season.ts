@@ -766,7 +766,7 @@ export function buildSeasonNote(cities: CitySeasonSummary[]): string {
       : ""
   }${
     havePollen
-      ? ` Pollen levels are the typical monthly tree (birch, alder, olive), grass and weed (mugwort, ragweed) pollen from the Copernicus CAMS European air-quality model via Open-Meteo (${POLLEN_START_DATE.slice(0, 4)}–${POLLEN_END_DATE.slice(0, 4)}) — monthly normals, not a live count, and a coarse model can understate a local burst.${havePollenGap ? " CAMS pollen covers European cities only, so any non-European cities here show none." : ""}`
+      ? ` Pollen levels are the typical monthly tree (birch, alder, olive), grass and weed (mugwort, ragweed) pollen from the Copernicus CAMS European air-quality model via Open-Meteo (${POLLEN_START_DATE.slice(0, 4)}–${POLLEN_END_DATE.slice(0, 4)}) — a monthly mean of daily average concentrations (not daily peaks), not a live count, and a coarse model can understate a local burst.${havePollenGap ? " CAMS pollen covers European cities only, so any non-European cities here show none." : ""}`
       : ""
   }`;
 }
@@ -929,7 +929,10 @@ export function seasonModelView(summary: SeasonSummary): unknown {
     if (m.heatAdvisory && m.meanApparentMaxC != null) tags.push(`feels ~${m.meanApparentMaxC}°C`);
     if (m.aqiAdvisory && m.aqiBand) tags.push(`air ${m.aqiBand}`);
     if (m.uvAdvisory && m.uvIndex != null) tags.push(`UV ${m.uvIndex}`);
-    if (m.pollenAdvisory) tags.push("high pollen");
+    // Include the firing species + figure (like the heat/air/UV tags carry their value), so a date-flexible
+    // best/worst summary distinguishes an April birch month from a July grass month — a ragweed-only sufferer
+    // shouldn't be steered off a harmless-to-them birch month. pollenTag is non-null exactly when pollenAdvisory is.
+    if (m.pollenTag) tags.push(`pollen: ${m.pollenTag}`);
     return `${MONTHS_SHORT[m.month - 1]} ${LABEL_WORD[m.label]} (${m.temp}, ${m.meanMaxC}°C, ${m.rain}${
       tags.length ? "; " + tags.join("; ") : ""
     })`;
@@ -1006,7 +1009,11 @@ export function seasonModelView(summary: SeasonSummary): unknown {
       // traveler at a quieter window. A LIST (not a single worst month like UV) because pollen has several disjoint
       // seasons — tree in spring, grass in summer, weed in late summer — that one "worst month" would misrepresent.
       const highPollenMonths =
-        tm == null ? c.months.filter((m) => m.pollenAdvisory).map((m) => MONTHS_SHORT[m.month - 1]) : [];
+        tm == null
+          ? c.months
+              .filter((m) => m.pollenAdvisory)
+              .map((m) => `${MONTHS_SHORT[m.month - 1]} (${m.pollenTag!})`)
+          : [];
       return {
         name: c.name,
         tropical: c.tropical || undefined,
