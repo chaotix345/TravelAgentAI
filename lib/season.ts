@@ -3,6 +3,7 @@ import { computeDaylightHours, daylightAdvisory, daylightSwing } from "./dayligh
 import { computeHeatAdvisory, aqiBandFor, aqiAdvisory, truncTenth } from "./airheat";
 import { computeAltitudeAdvisory, altitudeTier } from "./altitude";
 import { uvBandFor, uvAdvisory } from "./uv";
+import { pollenAdvisory, pollenTag, POLLEN_SPECIES, type PollenReadings, type PollenSpecies } from "./pollen";
 import type {
   MonthSeason,
   SeasonLabel,
@@ -70,6 +71,16 @@ const AQ_ENDPOINT = "https://air-quality-api.open-meteo.com/v1/air-quality";
 const AQ_START_DATE = "2023-01-01";
 const AQ_END_DATE = "2024-12-31";
 const AQ_TIMEOUT_MS = 8000;
+// Pollen rides a SEPARATE keyless fetch to the SAME air-quality endpoint but under the Copernicus CAMS *European*
+// model (domains=cams_europe): the cams_global model the PM2.5/UV fetch uses returns the pollen columns ALL-NULL,
+// and the European model in turn carries no UV — so the two genuinely can't be folded into one request (probed).
+// The pollen history shares CAMS's ~2022/2023-onward coverage, so we reuse the 2023-24 window. EUROPE-ONLY: a
+// non-European coordinate returns an explicit "no data" 400, which fetchPollenNormals reports as a definitive
+// "outside coverage" result distinct from a transient error (see its discriminated return type). Timeout matches
+// the others (Promise.allSettled waits for all three, so a longer pollen timeout would be the binding wall-clock).
+const POLLEN_START_DATE = "2023-01-01";
+const POLLEN_END_DATE = "2024-12-31";
+const POLLEN_TIMEOUT_MS = 8000;
 
 // --- Comfort model (tunable heuristics, like cost.ts's tier cutoffs / route.ts's distances) ---
 // The whole verdict turns on these. They were calibrated against known cases (Seville is brutal
@@ -146,6 +157,10 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const lerp = (x: number, x0: number, x1: number, y0: number, y1: number) =>
   y0 + ((x - x0) * (y1 - y0)) / (x1 - x0);
+// Round a raw value to a whole number, or null when it's absent/non-finite — used to round each pollen species'
+// monthly mean ONCE (so the stored tag and the advisory cite the same integer; the raw-vs-rounded discipline).
+const roundOrNull = (x: number | null | undefined) =>
+  x != null && Number.isFinite(x) ? Math.round(x) : null;
 
 // Temperature comfort from the mean daily high. Piecewise-linear; see the constants above.
 function tempScore(meanMaxC: number): number {
@@ -211,6 +226,19 @@ type MonthlyNormals = {
 // (Renamed from AqiMonthlyNormals now that it carries a WHO UV field beside the EPA-AQI PM2.5 one — the
 // name reflects the SOURCE, the Copernicus CAMS global model, not one of the two standards it feeds.)
 type CamsMonthlyNormals = Array<{ meanPm25: number | null; uvIndex: number | null }>;
+
+// Raw monthly per-species pollen normals for one city (grains/m³), the monthly mean of each day's 24-hour MEAN.
+// 12 elements; each species null when CAMS had no data that month. RAW from the fetch — classify() rounds once.
+type PollenMonthlyNormals = Array<Record<PollenSpecies, number | null>>;
+// fetchPollenNormals's discriminated result. "ok" with the 12 monthly normals; "eu_unavailable" when the endpoint
+// DEFINITIVELY reported the coordinate outside the European model's coverage (a parsed "no data" 400) — a STABLE
+// fact worth caching as pollenFetched:false; "error" for any transient/ambiguous failure (timeout, network, a
+// non-geographic 400, a parse miss), which must NOT be cached as a coverage verdict, so the city re-fetches. This
+// three-way split is the load-bearing fix for the cache-poison trap: a Berlin timeout must never read as "non-EU".
+type PollenFetchResult =
+  | { status: "ok"; months: PollenMonthlyNormals }
+  | { status: "eu_unavailable" }
+  | { status: "error" };
 
 async function fetchNormals(
   lat: number,
@@ -397,6 +425,100 @@ async function fetchAirQualityNormals(
   }
 }
 
+// One geocoded city's typical monthly pollen, per species, from the Copernicus CAMS EUROPEAN model via Open-Meteo's
+// keyless air-quality endpoint. A THIRD fetch, separate from the climate and the cams_global air-quality ones, run
+// in parallel (Promise.allSettled in assessSeason) so it degrades independently. It NEVER throws: every failure maps
+// to a discriminated result so a transient timeout can't be mistaken for "this city has no pollen" (the cache-poison
+// trap). The hourly→daily→monthly fold mirrors PM2.5's daily-MEAN path (NOT UV's daily-MAX): published pollen
+// severity scales are all defined on the daily mean and pollen does not zero at night, so a 24h mean is correct
+// (a daily MAX would inflate every figure ~2-3× and over-alert). Each species accumulates independently, so a null
+// in one never drops another.
+async function fetchPollenNormals(
+  lat: number,
+  lon: number,
+  signal?: AbortSignal,
+): Promise<PollenFetchResult> {
+  try {
+    const fields = POLLEN_SPECIES.map((s) => `${s}_pollen`).join(",");
+    const url =
+      `${AQ_ENDPOINT}?latitude=${lat}&longitude=${lon}` +
+      `&hourly=${fields}&start_date=${POLLEN_START_DATE}&end_date=${POLLEN_END_DATE}` +
+      `&domains=cams_europe&timezone=UTC`;
+    const timeout = AbortSignal.timeout(POLLEN_TIMEOUT_MS);
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+    if (!res.ok) {
+      // A 400 is AMBIGUOUS: the European model returns it BOTH for a coordinate outside its coverage (a stable
+      // "outside Europe" fact) AND for a malformed request (a bug). Distinguish by the body's reason string — only
+      // the geographic case becomes a cached coverage verdict; anything else stays a transient "error" so a URL
+      // bug can't permanently brand a real European city as non-European.
+      if (res.status === 400) {
+        let reason = "";
+        try {
+          const body = (await res.json()) as { reason?: unknown };
+          reason = typeof body?.reason === "string" ? body.reason : "";
+        } catch {
+          /* non-JSON body — treat as a transient error, not a coverage verdict */
+        }
+        if (/no data is available for this location/i.test(reason)) {
+          return { status: "eu_unavailable" };
+        }
+      }
+      console.warn(`CAMS pollen HTTP ${res.status} for ${lat},${lon}`);
+      return { status: "error" };
+    }
+    const data = (await res.json()) as {
+      hourly?: { time?: string[] } & Partial<Record<`${PollenSpecies}_pollen`, Array<number | null>>>;
+    };
+    const h = data?.hourly;
+    if (!h?.time || !Array.isArray(h.time)) return { status: "error" };
+
+    // Pass 1: hourly → per-day MEAN, per species (independent accumulators keyed on the YYYY-MM-DD prefix). Skip
+    // null / non-finite / negative samples so a gap or a sentinel can't poison a day's mean. timezone=UTC means each
+    // timestamp belongs cleanly to one calendar day.
+    const dailyBySpecies: Record<PollenSpecies, Map<string, { sum: number; n: number }>> = {
+      alder: new Map(), birch: new Map(), grass: new Map(),
+      mugwort: new Map(), olive: new Map(), ragweed: new Map(),
+    };
+    for (const species of POLLEN_SPECIES) {
+      const arr = h[`${species}_pollen`] ?? [];
+      const daily = dailyBySpecies[species];
+      for (let i = 0; i < h.time.length; i++) {
+        const v = arr[i];
+        if (v == null || !Number.isFinite(v) || (v as number) < 0) continue;
+        const dayKey = h.time[i].slice(0, 10);
+        const b = daily.get(dayKey) ?? { sum: 0, n: 0 };
+        b.sum += v as number;
+        b.n++;
+        daily.set(dayKey, b);
+      }
+    }
+
+    // Pass 2: per-day mean → monthly mean (each day weighted equally). Guard a malformed month index, mirroring
+    // fetchNormals/fetchAirQualityNormals; a month with zero valid days stays null (never 0/0 = NaN). RAW here —
+    // classify() rounds each species ONCE, so the stored figure and the banded value can't diverge.
+    const months: PollenMonthlyNormals = Array.from({ length: 12 }, () => ({
+      alder: null, birch: null, grass: null, mugwort: null, olive: null, ragweed: null,
+    }));
+    for (const species of POLLEN_SPECIES) {
+      const acc = Array.from({ length: 12 }, () => ({ sum: 0, n: 0 }));
+      for (const [dayKey, b] of dailyBySpecies[species]) {
+        const mo = Number.parseInt(dayKey.slice(5, 7), 10) - 1;
+        if (!Number.isFinite(mo) || mo < 0 || mo > 11) continue;
+        acc[mo].sum += b.sum / b.n;
+        acc[mo].n++;
+      }
+      for (let m = 0; m < 12; m++) months[m][species] = acc[m].n > 0 ? acc[m].sum / acc[m].n : null;
+    }
+    return { status: "ok", months };
+  } catch {
+    // Timeout / abort / network / parse — never evidence of anything, just no pollen data this time.
+    return { status: "error" };
+  }
+}
+
 // Turn 12 monthly normals into 12 scored, labelled MonthSeason records plus the tropical/
 // challenging flags and a best-window string. Takes the city's latitude so it can attach each
 // month's daylight hours + advisory (pure astronomy, no network), and the optional air-quality
@@ -406,7 +528,12 @@ async function fetchAirQualityNormals(
 // apart from its inputs — so it's easy to test. NOTE altitude is NOT built here: it is a per-CITY
 // (month-invariant) signal, so it's assembled in assessSeason() on the CitySeasonSummary, not in these
 // per-month records (see lib/altitude.ts) — do not move it into classify() to "match the pattern".
-function classify(normals: MonthlyNormals, lat: number, camsNormals?: CamsMonthlyNormals | null): {
+function classify(
+  normals: MonthlyNormals,
+  lat: number,
+  camsNormals?: CamsMonthlyNormals | null,
+  pollenNormals?: PollenMonthlyNormals | null,
+): {
   months: MonthSeason[];
   tropical: boolean;
   challenging: boolean;
@@ -463,6 +590,21 @@ function classify(normals: MonthlyNormals, lat: number, camsNormals?: CamsMonthl
     // so a fractional 9.2 would never match the "UV ~9" the advisory cites — the raw-vs-rounded lesson).
     const uvIndexRaw = camsNormals?.[i]?.uvIndex ?? null;
     const uvIndex = uvIndexRaw != null ? Math.round(uvIndexRaw) : null;
+    // Pollen rides a SEPARATE CAMS European fetch (null for a non-European city, or when that fetch failed). Round
+    // each species' raw monthly mean ONCE here, then derive the tooltip tag + the advisory from that same rounded
+    // reading, so they cite the same integer (the raw-vs-rounded discipline). Advisory-only — pollen is never read
+    // into the comfort[] array or labelFor() above, so it can't move the comfort score or season label.
+    const pollenRaw = pollenNormals?.[i] ?? null;
+    const pollen: PollenReadings | null = pollenRaw
+      ? {
+          alder: roundOrNull(pollenRaw.alder),
+          birch: roundOrNull(pollenRaw.birch),
+          grass: roundOrNull(pollenRaw.grass),
+          mugwort: roundOrNull(pollenRaw.mugwort),
+          olive: roundOrNull(pollenRaw.olive),
+          ragweed: roundOrNull(pollenRaw.ragweed),
+        }
+      : null;
     return {
       month: i + 1,
       label: labelFor(i),
@@ -484,6 +626,8 @@ function classify(normals: MonthlyNormals, lat: number, camsNormals?: CamsMonthl
       uvIndex,
       uvBand: uvBandFor(uvIndex),
       uvAdvisory: uvAdvisory(uvIndex),
+      pollenTag: pollenTag(pollen),
+      pollenAdvisory: pollenAdvisory(pollen),
     };
   });
 
@@ -602,6 +746,12 @@ export function buildSeasonNote(cities: CitySeasonSummary[]): string {
     (c) => c.source === "open-meteo" && c.months.some((m) => m.uvIndex != null),
   );
   const haveAltitude = cities.some((c) => c.source === "open-meteo" && c.altitudeAdvisory != null);
+  // Pollen data landed for at least one European city in THIS (final) set; gate the disclosure on it like the
+  // others so a plan that dropped its only European city doesn't credit a source nothing shows. havePollenGap =
+  // a city is DEFINITIVELY outside coverage (pollenFetched === false), which adds the honest "non-European cities
+  // show none" caveat — only on a mixed trip, never when every city is European.
+  const havePollen = cities.some((c) => c.source === "open-meteo" && c.pollenFetched === true);
+  const havePollenGap = cities.some((c) => c.source === "open-meteo" && c.pollenFetched === false);
   return `Weather grounded in Open-Meteo ERA5 climate normals (${START_DATE.slice(0, 4)}–${END_DATE.slice(0, 4)}). Labels reflect weather comfort, not crowds. Daylight hours are computed from each city's latitude (sunrise to sunset, mid-month value) — civil twilight adds roughly 20–40 minutes of usable light at each end (dawn and dusk), and local mountains can trim them.${haveHeat ? ` "Feels-like" highs are ERA5 apparent temperature, which folds in humidity, wind and sun.` : ""}${
     haveAqi
       ? ` Air quality is the typical monthly PM2.5 from the Copernicus Atmosphere Monitoring Service (CAMS) via Open-Meteo (${AQ_START_DATE.slice(0, 4)}–${AQ_END_DATE.slice(0, 4)}) — a monthly average, not a live reading, and a coarse global model can understate short, local pollution spikes such as crop-burning season.`
@@ -613,6 +763,10 @@ export function buildSeasonNote(cities: CitySeasonSummary[]): string {
   }${
     haveAltitude
       ? ` Elevation is from the Copernicus GLO-90 terrain model (via Open-Meteo), accurate to roughly ±100–150m for most cities — enough to gauge altitude, not a precise benchmark; acclimatization varies by person, fitness, and rate of ascent.`
+      : ""
+  }${
+    havePollen
+      ? ` Pollen levels are the typical monthly tree (birch, alder, olive), grass and weed (mugwort, ragweed) pollen from the Copernicus CAMS European air-quality model via Open-Meteo (${POLLEN_START_DATE.slice(0, 4)}–${POLLEN_END_DATE.slice(0, 4)}) — a monthly mean of daily average concentrations (not daily peaks), not a live count, and a coarse model can understate a local burst.${havePollenGap ? " CAMS pollen covers European cities only, so any non-European cities here show none." : ""}`
       : ""
   }`;
 }
@@ -659,6 +813,7 @@ export async function assessSeason(
     if (
       cached &&
       "elevationM" in cached &&
+      "pollenFetched" in cached &&
       cached.months.some((m) => m.meanPm25 != null && m.uvIndex != null)
     ) {
       out.push(cached);
@@ -679,12 +834,18 @@ export async function assessSeason(
         // (no air or UV data) and NEVER rejects the climate season, while a climate failure still degrades
         // the city to "no data" exactly as before. fetchAirQualityNormals never throws on its own, but
         // allSettled also stops the climate fetch's deliberate throw-on-error from taking it down.
-        const [normalsRes, aqiRes] = await Promise.allSettled([
+        const [normalsRes, aqiRes, pollenRes] = await Promise.allSettled([
           fetchNormals(geo.lat, geo.lon, signal),
           fetchAirQualityNormals(geo.lat, geo.lon, signal),
+          fetchPollenNormals(geo.lat, geo.lon, signal),
         ]);
         const normalsResult = normalsRes.status === "fulfilled" ? normalsRes.value : null;
         const camsNormals = aqiRes.status === "fulfilled" ? aqiRes.value : null;
+        // Pollen degrades independently like air quality. fetchPollenNormals never throws, but a rejected settle
+        // (defensive) maps to a transient error → pollenFetched stays absent → the city re-fetches next time.
+        const pollenResult: PollenFetchResult =
+          pollenRes.status === "fulfilled" ? pollenRes.value : { status: "error" };
+        const pollenNormals = pollenResult.status === "ok" ? pollenResult.months : null;
         // Altitude is assembled HERE, on the CitySeasonSummary, not inside classify() (which stays
         // per-month-only): elevation is month-invariant, so it's a city-level field. The 10m-rounded
         // elevationM fetchNormals returned is BOTH stored and banded by computeAltitudeAdvisory, so the
@@ -696,9 +857,13 @@ export async function assessSeason(
               country,
               geocoded: true,
               source: "open-meteo",
-              ...classify(normalsResult.normals, geo.lat, camsNormals),
+              ...classify(normalsResult.normals, geo.lat, camsNormals, pollenNormals),
               elevationM,
               altitudeAdvisory: computeAltitudeAdvisory(elevationM),
+              // pollenFetched is a TRI-STATE: set true (European, data present) or false (definitively outside
+              // Europe) ONLY for a definitive result; on a transient error LEAVE THE KEY ABSENT (conditional
+              // spread) so the cache-read guard re-fetches rather than caching the city as non-European.
+              ...(pollenResult.status === "error" ? {} : { pollenFetched: pollenResult.status === "ok" }),
             }
           : noData(name, country, true);
       }
@@ -764,6 +929,10 @@ export function seasonModelView(summary: SeasonSummary): unknown {
     if (m.heatAdvisory && m.meanApparentMaxC != null) tags.push(`feels ~${m.meanApparentMaxC}°C`);
     if (m.aqiAdvisory && m.aqiBand) tags.push(`air ${m.aqiBand}`);
     if (m.uvAdvisory && m.uvIndex != null) tags.push(`UV ${m.uvIndex}`);
+    // Include the firing species + figure (like the heat/air/UV tags carry their value), so a date-flexible
+    // best/worst summary distinguishes an April birch month from a July grass month — a ragweed-only sufferer
+    // shouldn't be steered off a harmless-to-them birch month. pollenTag is non-null exactly when pollenAdvisory is.
+    if (m.pollenTag) tags.push(`pollen: ${m.pollenTag}`);
     return `${MONTHS_SHORT[m.month - 1]} ${LABEL_WORD[m.label]} (${m.temp}, ${m.meanMaxC}°C, ${m.rain}${
       tags.length ? "; " + tags.join("; ") : ""
     })`;
@@ -772,7 +941,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   // the model adapts the day structure (front-load on short days or in extreme heat, mask/indoors on
   // bad-air days) instead of inferring it from raw numbers.
   const targetBrief = (m: MonthSeason) => {
-    const extras = [m.daylightAdvisory, m.heatAdvisory, m.aqiAdvisory, m.uvAdvisory].filter(Boolean);
+    const extras = [m.daylightAdvisory, m.heatAdvisory, m.aqiAdvisory, m.uvAdvisory, m.pollenAdvisory].filter(Boolean);
     return extras.length ? `${monthBrief(m)}; ${extras.join("; ")}` : monthBrief(m);
   };
   const tm = summary.targetMonth;
@@ -791,6 +960,7 @@ export function seasonModelView(summary: SeasonSummary): unknown {
   const targetHeat = targetCue((m) => m?.heatAdvisory ?? null);
   const targetAir = targetCue((m) => m?.aqiAdvisory ?? null);
   const targetUv = targetCue((m) => m?.uvAdvisory ?? null);
+  const targetPollen = targetCue((m) => m?.pollenAdvisory ?? null);
   // Altitude heads-up is trip-level but city-NAMED (a vague "this trip is high" misattributes the day-1
   // advice to the wrong city — the adversarial lens's positional-encoding catch). Built from `grounded`
   // directly, NOT via targetCue, because altitude doesn't depend on a target month.
@@ -835,6 +1005,15 @@ export function seasonModelView(summary: SeasonSummary): unknown {
         tm == null && !yearRoundUvHigh
           ? [...c.months].filter((m) => m.uvAdvisory).sort((a, b) => (b.uvIndex ?? 0) - (a.uvIndex ?? 0))[0]
           : undefined;
+      // Date-flexible pollen steer: name the months pollen runs high so the model can point an allergy-prone
+      // traveler at a quieter window. A LIST (not a single worst month like UV) because pollen has several disjoint
+      // seasons — tree in spring, grass in summer, weed in late summer — that one "worst month" would misrepresent.
+      const highPollenMonths =
+        tm == null
+          ? c.months
+              .filter((m) => m.pollenAdvisory)
+              .map((m) => `${MONTHS_SHORT[m.month - 1]} (${m.pollenTag!})`)
+          : [];
       return {
         name: c.name,
         tropical: c.tropical || undefined,
@@ -854,6 +1033,11 @@ export function seasonModelView(summary: SeasonSummary): unknown {
           : {}),
         ...(worstUv ? { worstUvMonth: `${MONTHS_SHORT[worstUv.month - 1]} (UV ~${worstUv.uvIndex})` } : {}),
         ...(yearRoundUvHigh ? { yearRoundUvHigh: true } : {}),
+        ...(highPollenMonths.length > 0 ? { highPollenMonths: highPollenMonths.join(", ") } : {}),
+        // Tell the model plainly when a city is OUTSIDE pollen coverage (the DEFINITIVE non-European verdict only,
+        // never a transient error) so it won't invent pollen for it from training knowledge — paired with the
+        // prompt's pollen invention-ban. A European city or a transient pollen error stays silent here.
+        ...(c.pollenFetched === false ? { pollenDataUnavailable: true } : {}),
       };
     }),
     targetAssessment: summary.targetAssessment ?? undefined,
@@ -881,6 +1065,13 @@ export function seasonModelView(summary: SeasonSummary): unknown {
     ...(targetUv.length > 0
       ? {
           targetUvAdvisory: `${MONTHS[tm! - 1]} UV — ${targetUv
+            .map((x) => `${x.name}: ${x.v}`)
+            .join(" ")}`,
+        }
+      : {}),
+    ...(targetPollen.length > 0
+      ? {
+          targetPollenAdvisory: `${MONTHS[tm! - 1]} pollen — ${targetPollen
             .map((x) => `${x.name}: ${x.v}`)
             .join(" ")}`,
         }
