@@ -19,6 +19,12 @@ converted at a live **European Central Bank** reference rate (keyless, via Frank
 computed in USD and a fare Duffel happens to quote in another currency both land in the currency you
 actually think in.
 
+Give it a **departure city** and it also grounds the trip's **jet lag** — the real time-zone offset
+between home and your first stop, an evidence-based adjustment estimate (flying east is harder than
+west), a light-exposure cue, and a gentle-first-day nudge. It's the first **origin-relative** signal
+(a fact about the journey, not the destination) and is fully **keyless** — computed from IANA
+time-zone data (Open-Meteo Geocoding + `Intl`), so it works with or without a Duffel key.
+
 After the plan lands you can **refine it in plain language** — *"swap Coimbra for Braga",
 "make day 2 lighter", "add a city"* — and get back one revised, fully re-grounded plan
 (never a menu). That's the start of the **concierge** step in the product vision.
@@ -192,6 +198,19 @@ After the plan lands you can **refine it in plain language** — *"swap Coimbra 
   normally take"). Unlike UV, pollen needs its OWN keyless fetch (Copernicus CAMS *European* model,
   `domains=cams_europe`) and is **European cities only** — the network fetch (with a discriminated ok / outside-
   coverage / transient-error result, so a timeout never caches a city as non-European) stays in `lib/season.ts`.
+- **`lib/jetlag.ts`** — the **jet-lag / circadian** grounding, and the first **origin-relative**
+  signal (every other grounds the destination; this grounds the *crossing* between home and the first
+  stop). Mostly pure + zero-import-from-other-libs like `daylight.ts`: it geocodes the origin and
+  first city to IANA time-zone names via the keyless **Open-Meteo Geocoding** API, derives each one's
+  **DST-correct** UTC offset with `Intl.DateTimeFormat` on a representative travel-month date, and
+  computes the offset delta **in minutes** (half-/45-minute zones matter), canonicalized to the
+  shorter arc so a cross-dateline hop like New York→Tokyo reads as 10h **west**, not 13h east. From
+  that it derives an adjustment estimate (east ~1 day/time-zone, west faster — shown as a range, never
+  false precision; cited to the CDC Yellow Book + circadian reviews), a light-exposure cue, and a
+  gentle-first-day tip. It needs **no model turn** (a deterministic server pass at emit, like the FX
+  conversion), is fully keyless (no Duffel key), suppresses below a 3-hour floor, and carries **no
+  drug names / no dosing** — general travel guidance, not medical advice. The two geocodes (cached
+  per server instance, written only on success) run in `app/api/plan/route.ts`'s emit handler.
 - **`lib/holidays.ts`** — executes the `check_holidays` tool, grounding the **public holidays**.
   The season tool deliberately disclaims crowds and holidays; this fills that gap. For each
   *distinct country* in the trip (holidays are national, so a three-city France trip is one fetch)

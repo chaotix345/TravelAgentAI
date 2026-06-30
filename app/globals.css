@@ -1002,6 +1002,65 @@ button.link:hover {
   line-height: 1.45;
 }
 
+/* --- Jet lag (origin-relative time-zone crossing) --- */
+.jetlag {
+  margin: 0 0 28px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+}
+
+.jetlag-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.jetlag-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.jetlag-offset {
+  margin: 12px 0 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.jetlag-advisory {
+  margin: 8px 0 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+/* The day-1 pacing tip reads as an actionable recommendation — same pill language as the flight
+   "chosen for fewer stops" line, signalling "this is our suggestion" without being alarmist. */
+.jetlag-dayone {
+  margin: 10px 0 0;
+  padding: 6px 10px;
+  background: var(--accent-soft);
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.jetlag-return {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.jetlag-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 .city-season {
   padding: 12px 18px 14px;
   border-top: 1px solid var(--line);

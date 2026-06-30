@@ -18,6 +18,7 @@ import type {
   CountryHolidays,
   RouteSummary,
   RouteLeg,
+  JetlagSummary,
 } from "@/lib/schema";
 import { SAMPLE_BRIEFS } from "@/lib/sampleBriefs";
 import { fmtDaylight } from "@/lib/daylight";
@@ -361,28 +362,42 @@ export default function Home() {
         ))}
       </div>
 
-      {capabilities.flights && (
-        <div className="origin">
-          <label htmlFor="origin" className="q-label">
-            Flying from?
-          </label>
-          <input
-            id="origin"
-            type="text"
-            className="q-input"
-            value={origin}
-            maxLength={120}
-            disabled={loading}
-            aria-describedby="origin-hint"
-            placeholder="e.g. Sydney, London, New York — to price your flights"
-            onChange={(e) => setOrigin(e.target.value)}
-          />
-          <p id="origin-hint" className="origin-hint">
-            Optional. Add your departure city and I&apos;ll price round-trip flights
-            {capabilities.homeCurrency !== "USD" ? ` in ${capabilities.homeCurrency}` : ""}.
-          </p>
-        </div>
-      )}
+      {/* The origin field is NOT gated on a Duffel key: jet-lag grounding is fully keyless, so the
+          field always renders (which also removes the mount-time layout shift the old gate had).
+          capabilities.flights only varies the hint text — promising flight pricing when there's no
+          key would be a false promise. Always rendering keeps the keyless app byte-stable for the
+          empty-origin case (no origin → no jet-lag pass, no clause, unchanged behaviour). */}
+      <div className="origin">
+        <label htmlFor="origin" className="q-label">
+          Flying from?
+        </label>
+        <input
+          id="origin"
+          type="text"
+          className="q-input"
+          value={origin}
+          maxLength={120}
+          disabled={loading}
+          aria-describedby="origin-hint"
+          placeholder={
+            capabilities.flights
+              ? "e.g. Sydney, London, New York — for flights and jet-lag guidance"
+              : "e.g. Sydney, London, New York — for jet-lag guidance"
+          }
+          onChange={(e) => setOrigin(e.target.value)}
+        />
+        <p id="origin-hint" className="origin-hint">
+          {capabilities.flights ? (
+            <>
+              Optional. Add your departure city and I&apos;ll price round-trip flights
+              {capabilities.homeCurrency !== "USD" ? ` in ${capabilities.homeCurrency}` : ""} and
+              flag the time-zone change.
+            </>
+          ) : (
+            <>Optional. Add your departure city and I&apos;ll flag the time-zone change and jet lag.</>
+          )}
+        </p>
+      </div>
 
       {!questions && (
         <div className="row">
@@ -599,6 +614,7 @@ function Plan({
 
       {itinerary.budget && <BudgetBlock budget={itinerary.budget} />}
       {itinerary.flights && <FlightsBlock flights={itinerary.flights} />}
+      {itinerary.jetlag && <JetlagBlock jetlag={itinerary.jetlag} />}
       {itinerary.season && <SeasonBlock season={itinerary.season} />}
       {itinerary.holidays && <HolidaysBlock holidays={itinerary.holidays} />}
       {itinerary.route && <RouteBlock route={itinerary.route} />}
@@ -1035,6 +1051,36 @@ function FlightsBlock({ flights }: { flights: FlightSummary }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// The grounded jet-lag crossing, server-attached from the keyless lib/jetlag.ts pass — the FIRST
+// origin-relative signal (a fact about the journey, not the destination), so it sits with the other
+// journey-level blocks (budget, flights) and before the destination-level ones (season, holidays,
+// route). Every line is a server-computed advisory string printed verbatim — the same discipline as
+// the daylight/altitude advisories — and the block only renders when the server found a real crossing
+// (>= 3 hours), so there is never a "no jet lag" message to get wrong. General travel guidance, not
+// medical advice; no drug names — the disclosure line says exactly that.
+function JetlagBlock({ jetlag }: { jetlag: JetlagSummary }) {
+  return (
+    <div className="jetlag">
+      <div className="jetlag-head">
+        <span className="jetlag-title">Jet lag</span>
+        <span
+          className="badge ok"
+          tabIndex={0}
+          title="Computed from the real IANA time-zone offsets of your departure and arrival cities — general travel guidance, not medical advice"
+        >
+          grounded
+        </span>
+      </div>
+      <p className="jetlag-offset">{jetlag.headline}</p>
+      <p className="jetlag-advisory">{jetlag.adjustment}</p>
+      <p className="jetlag-advisory">{jetlag.light}</p>
+      <p className="jetlag-dayone">{jetlag.dayOne}</p>
+      {jetlag.returnNote && <p className="jetlag-return">{jetlag.returnNote}</p>}
+      <p className="jetlag-note">{jetlag.disclosure}</p>
     </div>
   );
 }
