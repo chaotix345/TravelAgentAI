@@ -152,9 +152,15 @@ export function buildJetlag(p: {
 
   const direction: "east" | "west" = delta > 0 ? "east" : "west";
   const east = direction === "east";
-  // East ~1 day per hour crossed (phase advance); west ~1 day per 1.5h (phase delay is easier
-  // because the human circadian period runs slightly long). Round (it's a population mean), cap at 7.
-  const central = Math.min(Math.round(mag / (east ? 60 : 90)), MAX_ADJUST_DAYS);
+  // East ~1 day per timezone (phase advance, harder); west ~1 day per 1.5 timezones (phase delay,
+  // easier — the circadian period runs slightly long). Round (a population mean), cap at MAX_ADJUST_DAYS.
+  // `capped` marks where the per-zone rule of thumb would imply MORE days than we cap/show, so the
+  // adjustment wording drops the rule there (else a 9h-east shift shows "6–7 days" while the text
+  // implies 9). The low===high range branch is a defensive fallback — unreachable at the current ±1
+  // spread, since low=central-1 and high=central+1 never coincide once central>=1.
+  const rawDays = Math.round(mag / (east ? 60 : 90));
+  const central = Math.min(rawDays, MAX_ADJUST_DAYS);
+  const capped = rawDays > MAX_ADJUST_DAYS;
   const low = Math.max(1, central - 1);
   const high = Math.min(MAX_ADJUST_DAYS, central + 1);
   const rangeStr =
@@ -179,9 +185,16 @@ export function buildJetlag(p: {
         rawAhead ? "ahead of" : "behind"
       } ${p.origin} — you're flying ${direction} across time zones.`;
 
+  // The per-zone rule of thumb holds until the cap bites; past it the range understates what the rule
+  // implies, so we drop the rule and say the body completes most of the adjustment within about a week.
+  const tail = capped
+    ? "for a shift this large the body typically completes most of the adjustment within about a week, regardless of the exact zone count"
+    : east
+      ? "figure on about a day for each time zone crossed"
+      : "figure on about a day for every one and a half time zones";
   const adjustment = east
-    ? `Allow ${rangeStr} for your body clock to catch up. Flying east (your clock has to shift earlier) is the harder direction — figure on about a day for each time zone crossed.`
-    : `Allow ${rangeStr} for your body clock to catch up. Flying west (your clock shifts later) usually settles a little faster — figure on about a day for every one and a half time zones.`;
+    ? `Allow ${rangeStr} for your body clock to catch up. Flying east (your clock has to shift earlier) is the harder direction — ${tail}.`
+    : `Allow ${rangeStr} for your body clock to catch up. Flying west (your clock shifts later) usually settles a little faster — ${tail}.`;
 
   let light = east
     ? `On arrival, get bright morning light and avoid bright light in the evening — that nudges your body clock earlier.`
@@ -199,7 +212,7 @@ export function buildJetlag(p: {
       : `Your return flies east — most travellers find the eastward direction a bit harder, on average, so ease back into your home schedule.`
     : null;
 
-  const disclosure = `General travel guidance, not medical advice — individual adjustment varies a lot, and the timing below is a rule of thumb. Time-zone offsets are DST-correct for ${rep.monthName} travel; time-zone data via Open-Meteo (CC BY 4.0).`;
+  const disclosure = `General travel guidance, not medical advice — individual adjustment varies a lot, and the adjustment estimate above is a rule of thumb. Time-zone offsets are DST-correct for ${rep.monthName} travel; time-zone data via Open-Meteo (CC BY 4.0).`;
 
   return {
     source: "computed",
@@ -222,7 +235,8 @@ export function buildJetlag(p: {
 // --- network layer (the only impure part) -----------------------------------------------------
 
 const OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search";
-const GEO_TIMEOUT_MS = 6000;
+const GEO_TIMEOUT_MS = 4000; // Open-Meteo geocoding is sub-second; a tight bound keeps the post-emit
+// jet-lag pass from leaving the NDJSON stream silent for long (the "finalizing" status precedes it).
 const USER_AGENT = "TravelAgentAI/0.1 (personal learning project)";
 
 // Module-level cache of resolved IANA timezone names, keyed by folded name|country. IANA assignments
@@ -271,8 +285,14 @@ export async function geocodeTimezone(
     // Cache + return ONLY a confirmed non-empty timezone string. Anything else falls through to
     // null WITHOUT writing the cache, so a transient miss can be retried on a later request.
     if (typeof tz === "string" && tz.length > 0) {
-      tzCache.set(key, tz);
-      return tz;
+      // Validate the zone is ICU-recognized BEFORE caching: Open-Meteo returns standard IANA names,
+      // but caching a string Intl can't parse would suppress jet-lag for this city for the whole
+      // process lifetime (offsetMinutes would return null on every later use). offsetMinutes returns
+      // null on an unknown zone (Intl throws, we catch), so a bad value falls through to a retry.
+      if (offsetMinutes(tz, new Date()) !== null) {
+        tzCache.set(key, tz);
+        return tz;
+      }
     }
     return null;
   } catch {
@@ -299,7 +319,9 @@ export async function computeJetlag(
 
   const [oNameRaw, ...oRest] = o.split(",");
   const oName = oNameRaw.trim();
-  const oCountry = oRest.join(",").trim() || undefined;
+  // Use the LAST comma-segment as the country hint: "Sydney, Nova Scotia, Canada" → "Canada" (not
+  // "Nova Scotia, Canada", which would match no country and silently fall back to the wrong Sydney).
+  const oCountry = oRest.length > 0 ? oRest[oRest.length - 1].trim() || undefined : undefined;
   if (!oName) return null;
 
   const [originTzRes, destTzRes] = await Promise.allSettled([

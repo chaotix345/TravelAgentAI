@@ -353,8 +353,9 @@ function coerceArray(value: unknown): unknown[] {
 }
 
 // The traveler's explicit departure city from the "Flying from?" field. It's the only user input
-// that flows toward both the model's context AND an outbound API (Duffel), so we sanitize it
-// server-side (the client maxLength is UX only): strip control characters — the prompt-injection
+// that flows toward both the model's context AND outbound APIs (Duffel for flight pricing, Open-Meteo
+// for the keyless jet-lag timezone lookup), so we sanitize it server-side (the client maxLength is UX
+// only): strip control characters — the prompt-injection
 // vector, e.g. a stray newline that fakes a fresh instruction block — collapse whitespace, and
 // hard-cap the length (a city/airport name never needs 120 chars). The cleaned value rides in the
 // USER turn, never the system prompt, so this is defense-in-depth, not the sole boundary.
@@ -692,9 +693,9 @@ export async function POST(req: Request) {
       // a multi-city trip then gets a turn to check the route; the last turn we force it
       // to emit the final itinerary.
       // Append the explicit origin to the brief as a labeled line in the USER turn (not the system
-      // prompt). The model reads it for prose and to pick its first/last cities; the find_flights
-      // handler overrides the tool's origin arg with this same server-held value, so the actual
-      // search is grounded in it regardless of what the model echoes.
+      // prompt). The model reads it for prose and to pick its first/last cities. When flights are
+      // enabled the find_flights handler overrides the tool's origin arg with this same server-held
+      // value; and regardless of a Duffel key, the same origin drives the keyless jet-lag pass at emit.
       const briefForModel = hasOrigin ? `${brief}\n\nFlying from: ${origin}` : brief;
       const messages: Anthropic.MessageParam[] = [{ role: "user", content: briefForModel }];
       if (clarifications.length > 0) {

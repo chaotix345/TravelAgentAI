@@ -423,7 +423,7 @@ export type JetlagSummary = {
   originTz: string; // resolved IANA timezone, e.g. "Australia/Sydney"
   destinationCity: string; // the first city of the trip (the one flown into)
   destinationTz: string; // resolved IANA timezone, e.g. "Asia/Tokyo"
-  deltaMinutes: number; // canonicalized to [-720, 720]; sign: + = destination ahead (flying east)
+  deltaMinutes: number; // CANONICAL shorter-arc delta in [-720, 720]; sign: + = adapt east, - = adapt west (for a cross-dateline trip this can flip sign vs the raw clock offset stated in the headline)
   direction: "east" | "west"; // "same"/below-floor crossings aren't attached at all
   adjustmentDays: number; // central estimate (the UI shows a ±1-day range string, not this raw int)
   headline: string; // plain-language offset statement
